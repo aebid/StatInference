@@ -68,6 +68,8 @@ def optimize_binning(shapes_dir, filename, sig_string, params, mass_list, outdir
             limit_history[dict_key] = {'nBins': [], 'limits': []}
 
     for ch, cat in priority_list:
+        print("New category, reset best_limit")
+        best_limit = np.inf
         ch_cat = f'{ch}/{cat}/'
         dict_key = f'{ch}_{cat}'
         hist_names = [ key.split(';')[0][len(ch_cat):] for key in file.keys() if key.startswith(ch_cat) ]
@@ -87,19 +89,25 @@ def optimize_binning(shapes_dir, filename, sig_string, params, mass_list, outdir
 
         #Start the loop over nBins from 1 to nBinsMax
         patience = 0
-        for nbins in range(1, nBinsMax):
+        # for nbins in range(1, nBinsMax):
+        for nbins in range(5, nBinsMax+1, 5):
             bin_content_goal = tmp_signal/nbins
 
             print(f"Channel {ch_cat} has a total of {tmp_signal} entries, so with {nbins} bins our per-bin goal is {bin_content_goal}")
 
             custom_binning = [1.0]
             custom_totals = []
+            custom_background_totals = []
             done = False
             nBins = len(hists[signal_name].values())-1
             right_edge = nBins
             big_bin_counter = 1
+            minimum_bin = 0
+            # If you want to put a cut, change this minimum bin
+            minimum_bin = int(0.0*(nBins+1))
+            print(f"Using minimum bin {minimum_bin} from nBins {nBins}")
             while not done:
-                for left_edge in range(right_edge, -1, -1):
+                for left_edge in range(right_edge, minimum_bin-1, -1):
                     tot_integral_signal = integrate_uproot(hists[signal_name], left_edge, nBins)[0]
                     curr_integral_signal = integrate_uproot(hists[signal_name], left_edge, right_edge)[0]
                     integral_bkgs = np.zeros(len(important_backgrounds))
@@ -120,40 +128,48 @@ def optimize_binning(shapes_dir, filename, sig_string, params, mass_list, outdir
                         tot_bkgs_unc += (int_bkg[1]**(2.0))
 
                     if negative_bins:
+                        if left_edge == minimum_bin:
+                            print("Negative bins all the way to the edge, cannot use this binning")
+                            done = True
+                            break
                         continue
 
                     tot_bkgs_unc = np.sqrt(tot_bkgs_unc)
 
 
-                    if left_edge ==  0:
-                        custom_binning.append(left_edge)
+                    if left_edge == minimum_bin:
+                        custom_binning.append(left_edge/(nBins+1))
                         custom_totals.append(curr_integral_signal)
+                        custom_background_totals.append(tot_bkgs)
                         done = True
                         print("Hit the left edge")
                         break
 
                     if (tot_integral_signal >= big_bin_counter*bin_content_goal):
-                        print(f"Check out the background unc/tot {integral_bkgs_unc/integral_bkgs}")
-                        print(f"Check the backgrounds for empty bins")
+                        # print(f"Check out the background unc/tot {integral_bkgs_unc/integral_bkgs}")
+                        # print(f"Check the backgrounds for empty bins")
                         for bkg_name in bkg_names_with_unc:
                             this_bkg_int = integrate_uproot(hists[bkg_name], left_edge, right_edge)
                             # print(f"{bkg_name} has {this_bkg_int[0]} entries and {this_bkg_int[1]} uncertainty")
 
-                        print(f"And the total bkg / tot bkg unc is {tot_bkgs} / {tot_bkgs_unc} = {tot_bkgs/tot_bkgs_unc}")
+                        # print(f"And the total bkg / tot bkg unc is {tot_bkgs} / {tot_bkgs_unc} = {tot_bkgs/tot_bkgs_unc}")
 
 
                     if (tot_integral_signal >= big_bin_counter*bin_content_goal) and (np.max(integral_bkgs_unc/integral_bkgs) <= 0.2) and (tot_bkgs_unc/tot_bkgs <= 0.2):       
-                        custom_binning.append(round(hists[signal_name].axis().edges()[left_edge], 2))
+                        custom_binning.append(round(hists[signal_name].axis().edges()[left_edge], 3)) # Why am i even rounding here?
                         custom_totals.append(curr_integral_signal)
+                        custom_background_totals.append(tot_bkgs)
                         print("At bin ", left_edge, " integral is ", custom_totals[-1])
                         right_edge = left_edge-1
                         big_bin_counter+=1
                         break
 
+
             if len(custom_binning) < 2:
-                raise ValueError(f"Custom binning for {dict_key} is too small, only {len(custom_binning)} bins found, something went wrong!")
+                raise ValueError(f"Custom binning for {dict_key} is too small, only {len(custom_binning)} bins found, something went wrong! {custom_binning}")
             print("Found the bin edge set, it is ", custom_binning)
             print("With totals per bin as ", custom_totals)
+            print(f"And backgrounds per bin {custom_background_totals}")
 
             if custom_totals[-1] < 0.2*bin_content_goal:
                 print("Final bin was very very small, auto merged!")
@@ -179,12 +195,19 @@ def optimize_binning(shapes_dir, filename, sig_string, params, mass_list, outdir
             binning_file = os.path.join(outdir, f'tmp_binning_{sig_string}.json')
 
 
-            ps_call(f"python3 ../dc_make/create_datacards.py --input {shapes_dir} --output {datacards_dir} --config {config} --hist-bins ./{binning_file} --param_values {mass_list}", shell=True, env=cmssw_env)
+            # Hold up, why am I optimizing by running all channels/categories at once?
+            # I should be running each channel/category separately, so that I can optimize the binning for each individually")
+            # If we catch std out, then i can avoid printing the create_datacards output!
+            quiet_call = ps_call(f"python3 ../dc_make/create_datacards.py --input {shapes_dir} --output {datacards_dir} --config {config} --hist-bins ./{binning_file} --param_values {mass_list}", shell=True, env=cmssw_env, catch_stdout=True)
+            # If we want to do this per channel/category, we need to reset datacards_dir to the subfolder
+            datacards_dir_category = os.path.join(datacards_dir, f'Run3_2022/{cat}')
             #Find out where the limits will be saved
-            output = ps_call(f"law run MergeResonantLimits --version {tag} --datacards '{datacards_dir}/*.txt' --print-output 0,False", shell=True, catch_stdout=True, split="\n")[1]
+            # output = ps_call(f"law run MergeResonantLimits --version {tag} --datacards '{datacards_dir}/*.txt' --print-output 0,False", shell=True, catch_stdout=True, split="\n")[1]
+            output = ps_call(f"law run MergeResonantLimits --version {tag} --datacards '{datacards_dir_category}/*.txt' --print-output 0,False", shell=True, catch_stdout=True, split="\n")[1]
             limit_file_name = output[-2]
             #Run the limit calculation
-            ps_call(f"law run MergeResonantLimits --version {tag} --datacards '{datacards_dir}/*.txt' --remove-output 3,a,y", shell=True)
+            # ps_call(f"law run MergeResonantLimits --version {tag} --datacards '{datacards_dir}/*.txt' --remove-output 3,a,y", shell=True)
+            ps_call(f"law run MergeResonantLimits --version {tag} --datacards '{datacards_dir_category}/*.txt' --remove-output 3,a,y", shell=True)
 
             #Now load the output numpy array and get value [1] (mass, val, up1, down1, up2, down2)
             print(np.load(limit_file_name).files)
@@ -196,21 +219,28 @@ def optimize_binning(shapes_dir, filename, sig_string, params, mass_list, outdir
             limit_list.append(exp_limit)
 
             #If adding a bin does not improve (limit stays the same) then just move on
-            if (exp_limit <= best_limit) or (nbins == 1):
+            if (exp_limit < best_limit) or (nbins == 1):
+                if np.isnan(exp_limit): exp_limit = np.inf
                 best_limit = exp_limit
                 best_bins = bins_dict.copy()
                 patience = 0
 
+            # elif (exp_limit == best_limit):
             else:
-                print(f"Did not improve limits at nbins {nbins}, best limit was {best_limit}, and current was {exp_limit}")
+                print(f"Limit did not change at nbins {nbins}, best limit is still {best_limit}, and current is {exp_limit}")
                 # I don't want to let it go to nMax each time, but also don't want to give up too early
                 # Introduce patience, allow 3 consecutive 'worse' limits before giving up
                 patience += 1
                 print(f"Patience now set to {patience}")
+                #Need to replace the bin dict because it now has the 'worse' new binning
+                bins_dict = best_bins.copy()
                 if patience >= 3:
                     #Need to replace the bin dict because it now has the 'worse' new binning
-                    bins_dict = best_bins.copy()
+                    # bins_dict = best_bins.copy()
                     break
+            # else:
+            #     print(f"Did not improve limits at nbins {nbins}, best limit was {best_limit}, and current was {exp_limit}")
+            #     break
 
 
 
@@ -245,7 +275,7 @@ if __name__ == '__main__':
         parser.add_argument('--output', required=True, type=str, help="output directory for new binning, shapes, and datacards")
         parser.add_argument('--config', required=True, type=str, help="configuration file")
         parser.add_argument('--mass-list', required=True, type=str, help="list of mass values to scan over")
-        parser.add_argument('--nBinsMax', required=False, type=int, default=20, help="Maximum number of bins to test")
+        parser.add_argument('--nBinsMax', required=False, type=int, default=10, help="Maximum number of bins to test")
         parser.add_argument('--sig-name-pattern', required=False, type=str, default="ggRadion_HH_bbWW_M{}", help="Name format of signal in the shape files")
         parser.add_argument('--file-name-pattern', required=False, type=str, default="Run3_2022/shape_m{m}.root", help="Name format of input shape files")
         parser.add_argument('--background-names', required=False, type=str, default="TT", help="List of all background processes in the shapes file")

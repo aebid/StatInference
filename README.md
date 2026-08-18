@@ -56,6 +56,46 @@ does). An analysis using neither simply lists the categories its input already h
 `categories:` is always taken verbatim — it is the set of directories that exist in the
 input shapes, and nothing in `dc_make` derives or expands it.
 
+## Correlating uncertainties across eras
+
+A datacard bin belonging to a meta-era (an entry of `era_groups:`) holds the summed
+histograms of its sub-eras, so "which era is this nuisance for" has to be decided while
+that sum is being built rather than by which bin it lands in.
+
+The nuisance name and the input histogram name are the same string — `dc_make/maker.py`
+reads `<process>_<name>_<Up|Down>` — so **an era-specific nuisance is named by the
+producer**, not by `dc_make`. To split a source per era, give it an era-suffixed `name:`
+in each era's `weights.yaml` on the analysis side and declare one scoped entry per era:
+
+```yaml
+  - name: CMS_pileup_2022
+    type: shape
+    eras: [Run3_2022]
+  - name: CMS_pileup_2022EE
+    type: shape
+    eras: [Run3_2022EE]
+```
+
+A source that stays correlated keeps one unsuffixed `name:` in every era's `weights.yaml`
+and one unscoped datacard entry. There is no `decorrelate:` key: whether a source is split
+is visible from what the producer writes.
+
+`DatacardMaker` makes this work in two places, both of which treat a real era as a
+one-element meta-era so configurations without `era_groups:` are unaffected:
+
+- `uncAppliesTo` registers the nuisance on the meta-era bin when **any** sub-era matches,
+  since `Uncertainty.appliesTo` compares against the meta-era name and would otherwise
+  drop the entry silently -- 64 of 76 shape sources for HH->bbWW, the jet energy scale
+  among them. `getMVLnNValue` covers `hasMultipleValues` lookups, merging the sub-eras it
+  finds a value for into one number weighted by their yields.
+- `getCombinedShape` varies **only** the matching sub-eras and takes the others at their
+  nominal, so the sum is the meta-era shape with one era shifted. This is what the lnN
+  path has always done in `_getSubEraLnNVariedShapes`.
+
+A sub-era the uncertainty does apply to is still required to have its variation
+histogram; a missing one raises rather than being quietly treated as nominal. Suffixing
+the producer without the datacard, or the reverse, therefore fails loudly at build time.
+
 ## How to run binning optimisation on lxplus
 Open two separate LXPLUS terminals: one for **server side** and the other for **worker side**.
 Set up the environment and proxy in analysis area as usual on both terminals.

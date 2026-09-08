@@ -46,6 +46,7 @@ BINNING_DEFAULTS = {
     "min_slice_bkg_each_neff": 0.0,
     "min_bin_bkg_each": 0.01,
     "min_bin_bkg_neff": 4.0,
+    "min_bin_bkg_each_neff": 0.0,
     "bkg_per_bin": 5.0,
     "min_bkg_frac": 0.05,
     "min_signal": 0.5,
@@ -336,15 +337,17 @@ def _slice_passes(
     if min_neff > 0 and total_error is not None:
         if effective_entries(total, total_error) < min_neff:
             return False
-    if min_each > 0 or min_proc_neff > 0:
-        for name, value in yields.items():
-            if name in exempt:
-                continue
-            if value <= min_each:
+    for name, value in yields.items():
+        # As in _bin_passes: exemption covers the magnitude floor, never the sign.
+        if value < 0:
+            return False
+        if name in exempt:
+            continue
+        if min_each > 0 and value <= min_each:
+            return False
+        if min_proc_neff > 0 and errors is not None:
+            if effective_entries(value, errors.get(name, 0.0)) < min_proc_neff:
                 return False
-            if min_proc_neff > 0 and errors is not None:
-                if effective_entries(value, errors.get(name, 0.0)) < min_proc_neff:
-                    return False
     return True
 
 
@@ -368,7 +371,15 @@ def minor_backgrounds(bkg_hists_by_name, lo, hi, min_frac):
     return {name for name, value in yields.items() if value < min_frac * total}
 
 
-def _bin_passes(yields, min_each, exempt=(), total_error=None, min_neff=0.0):
+def _bin_passes(
+    yields,
+    min_each,
+    exempt=(),
+    total_error=None,
+    min_neff=0.0,
+    errors=None,
+    min_proc_neff=0.0,
+):
     """Mass-bin validity: every *relevant* background must exceed min_each, and
     (when min_neff > 0) the summed background must be known to at least min_neff
     effective MC entries.
@@ -392,10 +403,29 @@ def _bin_passes(yields, min_each, exempt=(), total_error=None, min_neff=0.0):
         if effective_entries(total, total_error) < min_neff:
             return False
     for name, value in yields.items():
+        # Positivity is never exemptable. `exempt` exists so a negligible process
+        # cannot veto every candidate split -- it is about the *magnitude* floor, not
+        # about sign. Letting an exempt process go negative does not merely leave an
+        # ugly bin: resolveNegativeBins in dc_make/maker.py rejects a negative bin
+        # that holds >= signalFractionForRelevantBins of the signal *unconditionally*,
+        # ignoring allow_negative_bins_within_error, so the datacard fails to build at
+        # all. Observed at m1000 muMu/SR/recovery_dnn1, where ST was 4.24% of the
+        # slice -- just under min_bkg_frac 0.05, hence exempt -- and came out at
+        # -0.567 +- 0.789, killing the production.
+        if value < 0:
+            return False
         if name in exempt:
             continue
         if value <= min_each:
             return False
+        # Every background must be measured, not merely present: a yield known only
+        # to a few hundred percent is not a background estimate. _slice_passes has
+        # carried this arm for the sliced axis; the mass axis, where essentially all
+        # fit bins live, had no per-process test at all -- only the summed one, which
+        # any single well-measured process satisfies on its own.
+        if min_proc_neff > 0 and errors is not None:
+            if effective_entries(value, errors.get(name, 0.0)) < min_proc_neff:
+                return False
     return True
 
 
@@ -551,7 +581,13 @@ def signal_quantile_ranges(sig_hist, n_bins, first_bin, last_bin):
 
 
 def merge_until_valid(
-    ranges, sig_hist, bkg_hists_by_name, min_each, exempt=(), min_neff=0.0
+    ranges,
+    sig_hist,
+    bkg_hists_by_name,
+    min_each,
+    exempt=(),
+    min_neff=0.0,
+    min_proc_neff=0.0,
 ):
     """Merge adjacent ranges until every one satisfies the background gates.
 
@@ -572,6 +608,8 @@ def merge_until_valid(
                 exempt,
                 _total_bkg_error(bkg_hists_by_name, lo, hi),
                 min_neff,
+                _bkg_errors(bkg_hists_by_name, lo, hi) if min_proc_neff > 0 else None,
+                min_proc_neff,
             ):
                 bad = i
                 break
@@ -599,6 +637,7 @@ def find_bins(
     min_each,
     min_frac=0.0,
     min_neff=0.0,
+    min_proc_neff=0.0,
 ):
     """Bins inside one slice: signal quantiles for the edges, background gates for
     the count.
@@ -620,7 +659,7 @@ def find_bins(
     exempt = minor_backgrounds(bkg_hists_by_name, first_bin, last_bin, min_frac)
     ranges = signal_quantile_ranges(sig_hist, max_bins, first_bin, last_bin)
     return merge_until_valid(
-        ranges, sig_hist, bkg_hists_by_name, min_each, exempt, min_neff
+        ranges, sig_hist, bkg_hists_by_name, min_each, exempt, min_neff, min_proc_neff
     )
 
 
@@ -671,6 +710,7 @@ def discover_binning(
     sig_mode="sb",
     min_slice_bkg_each=0.0,
     min_slice_bkg_each_neff=0.0,
+    min_bin_bkg_each_neff=0.0,
 ):
     """bkg2d_by_name: {background_name: [hist per discovery era, ...]}. The list
     is usually a single era's own histogram (standalone limit) or all of a
@@ -728,6 +768,7 @@ def discover_binning(
             min_bin_each,
             min_bkg_frac,
             min_bin_bkg_neff,
+            min_bin_bkg_each_neff,
         )
         bin_ranges = extend_outer_edges(bin_ranges, 0, ny + 1)
         result.append({"x_range": (xlo, xhi), "y_ranges": bin_ranges})
@@ -1003,6 +1044,7 @@ def process_category(
             knobs["significance_mode"],
             knobs["min_slice_bkg_each"],
             knobs["min_slice_bkg_each_neff"],
+            knobs["min_bin_bkg_each_neff"],
         )
         if slices is None:
             print(
@@ -1284,6 +1326,13 @@ if __name__ == "__main__":
         "min_bin_bkg_neff": (
             float,
             "minimum effective MC entries of the summed background in a bin",
+        ),
+        "min_bin_bkg_each_neff": (
+            float,
+            "minimum effective MC entries of every non-negligible background in a bin. "
+            "The summed test above is satisfied by any one well-measured process, so "
+            "this is what makes each background individually measured; bins are merged "
+            "into their lower-signal neighbour until it holds",
         ),
         "bkg_per_bin": (
             float,

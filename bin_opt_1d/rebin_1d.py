@@ -22,8 +22,11 @@ Two properties of find_slices() this inherits and does not paper over:
     mean exactly one bin escapes the floors and it should not be read as though it had
     passed them.
   * grow_slice() does not reserve axis for the ranges still to be placed, so a scan can
-    run out and return None. That is a rejected category, not a binning with a hole in
-    it: process_category() drops it exactly as discover_binning() does in 2D.
+    run out and return None. That is never a binning with a hole in it. Here it means the
+    category cannot carry that many bins, so process_category() retries with one fewer,
+    down to min_bins, and rejects the category outright only if even that fails -- which
+    is what discover_binning() does immediately in 2D, where the count cannot vary because
+    a range there is a whole category.
 
 Usage is the same as rebin_2d.py -- a standalone pre-step writing the
 "<era>/<variable>/<variable>.root" layout HistMergerTask produces, consumed by pointing
@@ -78,7 +81,11 @@ ROOT = importROOT()
 # here; they are handed to find_slices() in the argument positions rebin_2d fills from its
 # min_slice_* knobs, which is the same scan gated the same way.
 BINNING_DEFAULTS = {
+    # n_bins is the most bins a category may take; min_bins the fewest it may be cut to
+    # before it is rejected instead. Equal values reproduce a fixed count exactly, which is
+    # what the defaults do, so this stays a no-op unless a configuration asks for a range.
     "n_bins": 5,
+    "min_bins": 5,
     "min_bin_bkg_sum": 1.0,
     "min_bin_bkg_neff": 4.0,
     "min_bin_bkg_each": 0.01,
@@ -290,31 +297,62 @@ def process_category(
     if frozen is not None:
         ranges = record_to_ranges(frozen, axis, where)
     else:
-        ranges = find_slices(
-            disc_sig,
-            disc_bkg_by_name,
-            knobs["n_bins"],
-            1,
-            nx,
-            knobs["min_bin_bkg_sum"],
-            knobs["min_bin_bkg_neff"],
-            knobs["significance_mode"],
-            knobs["min_bin_bkg_each"],
-            knobs["min_bin_bkg_each_neff"],
-            knobs["min_bkg_frac"],
-        )
-        if any(r is None for r in ranges):
-            # Not recoverable by dropping the empty ranges: the count is fixed so that
-            # every mass point shares a category list, and a category binned into fewer
-            # bins at one mass than another is a different fit. Rejected whole, as
-            # discover_binning() does in 2D.
+        # n_bins is a maximum, not a quota: take the most bins this category can actually
+        # support under the floors, and step down when it cannot carry them.
+        #
+        # A single global count does not work here. The categories differ in background by
+        # three orders of magnitude -- at m600 eE/res2b holds ~53000 background events and
+        # muMu/boosted ~85 -- so one number is set by the poorest category and leaves the
+        # rich ones far coarser than their statistics allow. Measured: a fixed n_bins of 8
+        # rejected the same-flavour boosted categories at 18 of 20 mass points, while
+        # res2b and recovery took 8 comfortably.
+        #
+        # The step-down uses the gates themselves as the criterion rather than a separate
+        # heuristic, which matters because the binding constraint is not yield. bin_budget()
+        # in the 2D binner divides by background *yield*, and by that measure muMu/boosted's
+        # 85 events would license many bins; what actually stops it is DY's per-process
+        # effective entries. The gates already encode what a bin has to contain, so asking
+        # them is both cheaper and more honest than modelling it twice.
+        #
+        # Unlike 2D this is safe to vary per category and per mass. There a range is a
+        # *category*, so the count has to be fixed or the datacards would not share a
+        # category list; here a range is a bin inside one shape, each mass builds its own
+        # datacard, and the 2D mass axis already varies its bin count per slice.
+        ranges = None
+        n_used = 0
+        for n in range(knobs["n_bins"], knobs["min_bins"] - 1, -1):
+            candidate = find_slices(
+                disc_sig,
+                disc_bkg_by_name,
+                n,
+                1,
+                nx,
+                knobs["min_bin_bkg_sum"],
+                knobs["min_bin_bkg_neff"],
+                knobs["significance_mode"],
+                knobs["min_bin_bkg_each"],
+                knobs["min_bin_bkg_each_neff"],
+                knobs["min_bkg_frac"],
+            )
+            if not any(r is None for r in candidate):
+                ranges, n_used = candidate, n
+                break
+        if ranges is None:
             print(
-                f"    [skip] {channel}/{category} {param_name}={mass}: the "
-                f"{knobs['n_bins']} bins could not be placed -- the axis was exhausted "
+                f"    [skip] {channel}/{category} {param_name}={mass}: even "
+                f"{knobs['min_bins']} bins could not be placed -- the axis was exhausted "
                 "before the last boundary, so no window clears the background floors. "
-                "Lower n_bins or the floors for this configuration."
+                "Lower min_bins or the floors for this configuration."
             )
             return
+        if n_used != knobs["n_bins"]:
+            # Deliberately not worded as a failure, and deliberately not containing the
+            # phrase the rejection message uses: this is the mechanism working, and a log
+            # grep for rejections must not match it.
+            print(
+                f"    [bins] {channel}/{category} {param_name}={mass}: took {n_used} of "
+                f"up to {knobs['n_bins']} bins, the most its background supports"
+            )
         ranges = extend_outer_edges(ranges, 0, nx + 1)
 
     # One shared set of edges, applied to every source era in its own file.
@@ -511,7 +549,12 @@ if __name__ == "__main__":
     # Knob overrides. All default to None so that "not given" is distinguishable from
     # "given the same value as the default", which is what lets --binning-config win.
     knob_args = {
-        "n_bins": (int, "fixed number of bins per category (same for every mass)"),
+        "n_bins": (int, "most bins a category may take"),
+        "min_bins": (
+            int,
+            "fewest bins a category may be cut down to before it is rejected instead. "
+            "Equal to n_bins means a fixed count",
+        ),
         "min_bin_bkg_sum": (
             float,
             "minimum summed-background yield required in a bin",

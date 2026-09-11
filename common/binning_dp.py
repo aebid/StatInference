@@ -299,3 +299,214 @@ def _assert_close(got, want, atol, what):
             "do not reproduce the integrals the gates are defined on, so any binning "
             "derived from them would be cut in the wrong places."
         )
+
+
+NEG = -np.inf
+
+
+def partition_dp(score, valid, max_parts):
+    """Best partition of [0..n-1] into exactly k contiguous valid ranges, for every k.
+
+    Returns (values, partitions): values[k] is the total score of the best k-part
+    partition, or -inf if there is none, and partitions[k] is that partition as a list of
+    (lo, hi) index pairs. Index 0 is unused in both so that k reads as the part count.
+
+    Every k is returned rather than just the requested one, because the caller needs the
+    whole curve and it costs nothing to keep: the budget allocator picks each slice's bin
+    count by comparing what the slices would do with one more bin, which is exactly
+    values[k] against values[k+1]. Computing them one at a time would re-run the same DP.
+
+    Exact, not greedy. The score is additive over the parts -- Asimov Z^2 is what adds
+    across independent counting bins -- so the optimal k-part partition of a prefix is
+    built from an optimal (k-1)-part partition of a shorter prefix, and the usual
+    interval DP applies. O(max_parts * n^2).
+
+    `valid` is a mask, not a penalty: an invalid range is unreachable rather than merely
+    expensive, so a partition containing one cannot be returned at any score. That is what
+    keeps the background gates hard constraints instead of preferences.
+    """
+    n = score.shape[0]
+    max_parts = max(1, min(max_parts, n))
+    masked = np.where(valid, score, NEG)
+
+    dp = np.full((max_parts + 1, n + 1), NEG)
+    arg = np.full((max_parts + 1, n + 1), -1, dtype=int)
+    dp[0, 0] = 0.0
+    for k in range(1, max_parts + 1):
+        for e in range(k, n + 1):
+            # candidate: the last part is [s .. e-1], the rest is a (k-1)-part prefix
+            cand = dp[k - 1, :e] + masked[:e, e - 1]
+            s = int(np.argmax(cand))
+            if cand[s] > NEG:
+                dp[k, e] = cand[s]
+                arg[k, e] = s
+
+    values = [NEG] * (max_parts + 1)
+    partitions = [None] * (max_parts + 1)
+    for k in range(1, max_parts + 1):
+        if dp[k, n] == NEG:
+            continue
+        values[k] = float(dp[k, n])
+        parts = []
+        e = n
+        for kk in range(k, 0, -1):
+            s = int(arg[kk, e])
+            parts.append((s, e - 1))
+            e = s
+        partitions[k] = list(reversed(parts))
+    return values, partitions
+
+
+def allocate_budget(values_per_slice, total, n_min=1, n_max=None):
+    """Spend a fixed total number of bins across the slices, where it buys the most.
+
+    values_per_slice[k][n] is what slice k scores with n bins, as partition_dp returns it.
+    Returns the list of counts maximizing the summed score subject to sum(n) <= total and
+    n >= n_min everywhere, or None if even n_min is infeasible for some slice.
+
+    This is the part that fixes the allocation, and it is worth being explicit about why
+    a per-slice rule cannot. bin_budget() sizes a slice from its own background *yield*,
+    and yield is largest exactly where signal purity is lowest -- so on the bbWW DL shapes
+    the lowest DNN slice, carrying 0.1% of the total Asimov Z^2, was given a median of ten
+    HME bins, while the top slice carrying 87.5% of it was given a median of one and was a
+    single bin in 53% of categories. No local rule can see that, because the comparison
+    that matters is between slices. Here it is the only comparison being made.
+
+    n_min >= 1 is not negotiable: a slice with no bins is not a category, and every mass
+    point has to produce the same category list.
+
+    A knapsack rather than a sort, because the value of the n-th bin in a slice depends on
+    how many that slice already has -- Z^2 has diminishing returns in bin count -- so
+    "give the next bin to whoever gains most" is only correct if taken to convergence,
+    which is what the DP does in one pass. O(n_slices * total * n_max).
+    """
+    n_slices = len(values_per_slice)
+    if n_max is None:
+        n_max = max(len(v) - 1 for v in values_per_slice)
+    if total < n_min * n_slices:
+        total = n_min * n_slices
+
+    dp = np.full((n_slices + 1, total + 1), NEG)
+    arg = np.full((n_slices + 1, total + 1), -1, dtype=int)
+    dp[0, 0] = 0.0
+    for k in range(1, n_slices + 1):
+        vals = values_per_slice[k - 1]
+        for spent in range(total + 1):
+            best, best_n = NEG, -1
+            for n in range(n_min, min(n_max, len(vals) - 1, spent) + 1):
+                if vals[n] == NEG or dp[k - 1, spent - n] == NEG:
+                    continue
+                v = dp[k - 1, spent - n] + vals[n]
+                if v > best:
+                    best, best_n = v, n
+            dp[k, spent] = best
+            arg[k, spent] = best_n
+
+    spent = int(np.argmax(dp[n_slices]))
+    if dp[n_slices, spent] == NEG:
+        return None
+    counts = []
+    for k in range(n_slices, 0, -1):
+        n = int(arg[k, spent])
+        counts.append(n)
+        spent -= n
+    return list(reversed(counts))
+
+
+def _self_test(trials=400, seed=0):
+    """Check partition_dp and allocate_budget against exhaustive enumeration.
+
+    Both are short dynamic programs whose failure mode is silence: a subtly wrong
+    recurrence still returns a partition, and the binning it produces still looks like a
+    binning. On problems small enough to enumerate completely there is no reason to
+    settle for a plausible answer, so this compares against every partition there is.
+
+    Pure numpy, no ROOT and no input files, so it runs anywhere:
+        python3 -m StatInference.common.binning_dp
+    The half of this module that does need ROOT is checked by parity_check() instead.
+    """
+    import itertools
+
+    def brute_partitions(n, k):
+        for cuts in itertools.combinations(range(1, n), k - 1):
+            bounds = (0,) + cuts + (n,)
+            parts = [(bounds[i], bounds[i + 1] - 1) for i in range(k)]
+            yield parts
+
+    rng = np.random.default_rng(seed)
+    checked = 0
+    for _ in range(trials):
+        n = int(rng.integers(2, 9))
+        score = rng.normal(size=(n, n))
+        valid = rng.random((n, n)) > rng.uniform(0.0, 0.6)
+        for a in range(n):
+            for b in range(n):
+                if b < a:
+                    valid[a, b] = False
+                    score[a, b] = 0.0
+        values, partitions = partition_dp(score, valid, n)
+        for k in range(1, n + 1):
+            best = NEG
+            for part in brute_partitions(n, k):
+                if all(valid[a, b] for a, b in part):
+                    total = sum(score[a, b] for a, b in part)
+                    best = max(best, total)
+            got = values[k]
+            if best == NEG:
+                assert got == NEG, f"found a {k}-part partition where none exists"
+            else:
+                assert (
+                    abs(got - best) == 0 or abs(got - best) < 1e-9
+                ), f"partition_dp n={n} k={k}: {got} != optimum {best}"
+                part = partitions[k]
+                assert len(part) == k
+                assert (
+                    part[0][0] == 0 and part[-1][1] == n - 1
+                ), "does not cover the axis"
+                assert all(
+                    part[i][1] + 1 == part[i + 1][0] for i in range(k - 1)
+                ), "parts are not contiguous"
+                assert all(valid[a, b] for a, b in part), "returned an invalid range"
+            checked += 1
+
+    alloc_checked = 0
+    for _ in range(trials // 2):
+        n_slices = int(rng.integers(2, 5))
+        n_max = int(rng.integers(2, 7))
+        total = int(rng.integers(n_slices, n_slices * n_max + 1))
+        values_per_slice = []
+        for _ in range(n_slices):
+            # concave by construction, as Z^2 in bin count is
+            curve = [NEG] + list(np.sort(rng.random(n_max))[::-1].cumsum())
+            for i in range(1, n_max + 1):
+                if rng.random() < 0.15:
+                    curve[i] = NEG
+            values_per_slice.append(curve)
+        got = allocate_budget(values_per_slice, total, n_min=1, n_max=n_max)
+        best, best_combo = NEG, None
+        for combo in itertools.product(range(1, n_max + 1), repeat=n_slices):
+            if sum(combo) > total:
+                continue
+            if any(values_per_slice[k][combo[k]] == NEG for k in range(n_slices)):
+                continue
+            value = sum(values_per_slice[k][combo[k]] for k in range(n_slices))
+            if value > best:
+                best, best_combo = value, combo
+        if best_combo is None:
+            assert got is None, "allocated a budget where no feasible split exists"
+        else:
+            assert got is not None, "found no allocation though one exists"
+            assert sum(got) <= total, "allocation overspends the budget"
+            value = sum(values_per_slice[k][got[k]] for k in range(n_slices))
+            assert (
+                abs(value - best) < 1e-9
+            ), f"allocate_budget: {value} != optimum {best}"
+        alloc_checked += 1
+
+    return checked, alloc_checked
+
+
+if __name__ == "__main__":
+    n_part, n_alloc = _self_test()
+    print(f"partition_dp:    {n_part} (n, k) cases vs exhaustive enumeration -- OK")
+    print(f"allocate_budget: {n_alloc} cases vs exhaustive enumeration -- OK")

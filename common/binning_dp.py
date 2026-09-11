@@ -541,14 +541,25 @@ def binning_objective(cells, slices, mode):
     return sum(per_slice), per_slice
 
 
-def _ranges_from_column(column, n):
+def _ranges_from_column(column, n, include_outer=False):
     """M[i, j] = the rectangle sum for bins (i+1)..(j+1), from one column of a prefix sum.
 
     For a fixed x window, P[x1+1, :] - P[x0, :] is the running sum along y, and every
     y range is a difference of two of its entries -- so the whole (n, n) table of
     candidate ranges is one outer subtraction rather than n^2 lookups.
+
+    With include_outer the first and last bins swallow the under- and overflow, which is
+    what extend_outer_edges() does to the outermost ranges before they are written. A
+    search that scores the ranges without them is optimising something slightly different
+    from what ends up in the datacard -- 0.11% of the background on the DNN axis of these
+    shapes, small but not nothing, and concentrated entirely in the two outermost slices.
     """
-    return column[2 : n + 2][None, :] - column[1 : n + 1][:, None]
+    lo = column[1 : n + 1].copy()
+    hi = column[2 : n + 2].copy()
+    if include_outer:
+        lo[0] = column[0]
+        hi[-1] = column[n + 2]
+    return hi[None, :] - lo[:, None]
 
 
 def _neff_matrix(value, error):
@@ -710,3 +721,171 @@ def trim_by_marginal_gain(values_per_slice, counts, threshold):
             n -= 1
         trimmed.append(n)
     return trimmed
+
+
+def _exempt_masks(cells, min_frac, y0, y1, n, axis):
+    """Per-process boolean masks saying, for every candidate range, whether that process
+    is negligible inside it.
+
+    minor_backgrounds() judged over every candidate window at once. It stays the same
+    question it answers scalar-side -- is this process below min_frac of the total over
+    the range about to be subdivided -- but on the sliced axis there are nx(nx+1)/2 such
+    ranges and each one has its own answer, so it has to be a mask rather than a set.
+    """
+    masks = {}
+    if min_frac <= 0:
+        return masks
+    total = _axis_ranges(cells._bkg_tot, y0, y1, n, axis, True)
+    for name in cells.names:
+        value = _axis_ranges(cells._bkg[name], y0, y1, n, axis, True)
+        with np.errstate(invalid="ignore"):
+            masks[name] = (total > 0) & (value < min_frac * total)
+    return masks
+
+
+def _axis_ranges(prefix, a, b, n, axis, include_outer=False):
+    """All ranges along `axis`, at a fixed window [a, b] on the other one."""
+    if axis == "y":
+        column = prefix[b + 1] - prefix[a]
+    else:
+        column = prefix[:, b + 1] - prefix[:, a]
+    return _ranges_from_column(column, n, include_outer)
+
+
+def slice_axis_tables(cells, y_partitions, knobs, mode, exempt_full):
+    """(score, valid) for every candidate slice on the sliced axis, per slice index.
+
+    Returns arrays of shape (n_slices, nx, nx): entry [k, i, j] is what the x range
+    (i+1)..(j+1) would score if it were slice k, carrying slice k's current mass binning,
+    and whether it may be used that way at all.
+
+    Three conditions beyond "the slice itself passes its gates", each of which the obvious
+    version omits and each of which breaks something different:
+
+    - the candidate must be able to *afford* the mass bins it would inherit,
+      len(P_k) <= bin_budget(candidate). Without it the search shrinks a slice while
+      keeping the bin count the wider slice licensed, which silently defeats bkg_per_bin
+      -- the one knob holding the bin count down.
+    - every inherited mass bin must still pass _bin_passes inside the candidate, judged
+      against the *candidate's own* exempt set. The exempt set depends on the x range, so
+      the mass-bin validity mask is not invariant under a move of the slice boundaries.
+      This is also what makes the alternation monotone: with it, the incumbent binning is
+      a member of every step's feasible set, so a step can never return something worse.
+    - the slice-level gates use the exempt set computed once over the whole axis, which is
+      what find_slices() does -- a background negligible in this category must not be able
+      to veto every boundary.
+    """
+    nx = cells.nx
+    ny = cells.ny
+    n_slices = len(y_partitions)
+    score = np.zeros((n_slices, nx, nx))
+    valid = np.zeros((n_slices, nx, nx), dtype=bool)
+
+    # slice-level quantities span the whole y axis including under/overflow, because that
+    # is what _integral() on a TH2 does -- see this module's docstring
+    b_slice = _axis_ranges(cells._bkg_tot, 0, ny + 1, nx, "x", True)
+    b_slice = np.where(np.abs(b_slice) < cells._eps_tot, 0.0, b_slice)
+    v_slice = _axis_ranges(cells._var_tot, 0, ny + 1, nx, "x", True)
+    err_slice = np.sqrt(np.maximum(v_slice, 0.0))
+
+    slice_ok = np.triu(np.ones((nx, nx), dtype=bool))
+    slice_ok &= b_slice > knobs["min_slice_bkg_sum"]
+    if knobs["min_slice_bkg_neff"] > 0:
+        slice_ok &= _neff_matrix(b_slice, err_slice) >= knobs["min_slice_bkg_neff"]
+    for name in cells.names:
+        b_p = _axis_ranges(cells._bkg[name], 0, ny + 1, nx, "x", True)
+        b_p = np.where(np.abs(b_p) < cells._eps_bkg[name], 0.0, b_p)
+        slice_ok &= b_p >= 0
+        if name in exempt_full:
+            continue
+        if knobs["min_slice_bkg_each"] > 0:
+            slice_ok &= b_p > knobs["min_slice_bkg_each"]
+        if knobs["min_slice_bkg_each_neff"] > 0:
+            v_p = _axis_ranges(cells._var[name], 0, ny + 1, nx, "x", True)
+            slice_ok &= (
+                _neff_matrix(b_p, np.sqrt(np.maximum(v_p, 0.0)))
+                >= knobs["min_slice_bkg_each_neff"]
+            )
+
+    # how many mass bins each candidate slice could afford, from the same yield and the
+    # same arithmetic bin_budget() uses (y = 1..ny, as the greedy path's ProjectionY)
+    b_for_budget = _axis_ranges(cells._bkg_tot, 1, ny, nx, "x", True)
+    if knobs["bkg_per_bin"] > 0:
+        with np.errstate(invalid="ignore"):
+            afford = np.where(
+                b_for_budget <= 0,
+                1,
+                np.minimum(
+                    knobs["max_bins_per_slice"],
+                    (b_for_budget / knobs["bkg_per_bin"]).astype(int),
+                ),
+            )
+        afford = np.maximum(afford, 1)
+    else:
+        afford = np.full((nx, nx), knobs["max_bins_per_slice"])
+
+    exempt_masks = _exempt_masks(cells, knobs["min_bkg_frac"], 1, ny, nx, "x")
+
+    for k, partition in enumerate(y_partitions):
+        ok = slice_ok & (afford >= len(partition))
+        total = np.zeros((nx, nx))
+        for a, b in partition:
+            sig = _axis_ranges(cells._sig, a, b, nx, "x", True)
+            b_tot = _axis_ranges(cells._bkg_tot, a, b, nx, "x", True)
+            b_tot = np.where(np.abs(b_tot) < cells._eps_tot, 0.0, b_tot)
+            v_tot = _axis_ranges(cells._var_tot, a, b, nx, "x", True)
+            err = np.sqrt(np.maximum(v_tot, 0.0))
+            if knobs["min_bin_bkg_neff"] > 0:
+                ok &= _neff_matrix(b_tot, err) >= knobs["min_bin_bkg_neff"]
+            for name in cells.names:
+                b_p = _axis_ranges(cells._bkg[name], a, b, nx, "x", True)
+                b_p = np.where(np.abs(b_p) < cells._eps_bkg[name], 0.0, b_p)
+                ok &= b_p >= 0
+                magnitude = b_p > knobs["min_bin_bkg_each"]
+                if knobs["min_bin_bkg_each_neff"] > 0:
+                    v_p = _axis_ranges(cells._var[name], a, b, nx, "x", True)
+                    magnitude &= (
+                        _neff_matrix(b_p, np.sqrt(np.maximum(v_p, 0.0)))
+                        >= knobs["min_bin_bkg_each_neff"]
+                    )
+                mask = exempt_masks.get(name)
+                ok &= magnitude if mask is None else (magnitude | mask)
+            if mode == "asimov":
+                total += _asimov_z2_matrix(sig, b_tot, err)
+            else:
+                total += _sb_z2_matrix(sig, b_tot, err)
+        valid[k] = ok
+        score[k] = np.where(ok, total, 0.0)
+    return score, valid
+
+
+def partition_dp_staged(score, valid, n_parts):
+    """partition_dp where each part has its own score matrix, indexed by part number.
+
+    The sliced axis needs this because a candidate range is not worth the same amount in
+    every position: it carries the mass binning of whichever slice it becomes, so
+    score[k] is the table for the k-th slice and the DP has to keep track of which one it
+    is placing. Otherwise identical -- exactly n_parts contiguous valid ranges covering
+    the axis, maximising the total.
+    """
+    n = score.shape[1]
+    dp = np.full((n_parts + 1, n + 1), NEG)
+    arg = np.full((n_parts + 1, n + 1), -1, dtype=int)
+    dp[0, 0] = 0.0
+    for k in range(1, n_parts + 1):
+        masked = np.where(valid[k - 1], score[k - 1], NEG)
+        for e in range(k, n + 1):
+            cand = dp[k - 1, :e] + masked[:e, e - 1]
+            s = int(np.argmax(cand))
+            if cand[s] > NEG:
+                dp[k, e] = cand[s]
+                arg[k, e] = s
+    if dp[n_parts, n] == NEG:
+        return None
+    parts = []
+    e = n
+    for k in range(n_parts, 0, -1):
+        s = int(arg[k, e])
+        parts.append((s, e - 1))
+        e = s
+    return list(reversed(parts))

@@ -49,6 +49,8 @@ from StatInference.common.binning_dp import (
     build_cells,
     check_mask_against_gate,
     partition_dp,
+    partition_dp_staged,
+    slice_axis_tables,
     slice_tables,
     trim_by_marginal_gain,
 )
@@ -93,6 +95,10 @@ BINNING_DEFAULTS = {
     # Z^2 by at least this fraction of the category's own achievable total, or it is given
     # back. 0.0 leaves the count to the budget alone, which is the previous behaviour.
     "dp_min_bin_gain": 0.0,
+    # How many times to re-place the slice boundaries against the mass binning and back.
+    # 0 leaves the boundaries where find_slices() put them and only replaces the mass
+    # axis, which is the cheaper half and the one that can be compared to greedy directly.
+    "dp_max_iterations": 0,
 }
 
 # Named here so the yaml path can be checked against the same list the command line's
@@ -484,26 +490,120 @@ def _best_count(values, cap):
     return best_n
 
 
+def _y_step(cells, slices, knobs):
+    """The mass binning of every slice, and the bin count each one keeps.
+
+    Budgets first, then whichever of them the value of a bin actually justifies. The
+    order matters: dp_min_bin_gain only ever gives bins back, so it is applied to the
+    counts the budget allowed rather than being a second thing competing with it.
+    """
+    max_bins = knobs["max_bins_per_slice"]
+    curves, budgets = [], []
+    for xlo, xhi in slices:
+        values, ranges = _slice_dp_curve(cells, xlo, xhi, knobs, max_bins)
+        curves.append((values, ranges))
+        # y = 1..ny because bin_budget() is handed a ProjectionY and asked for (1, ny),
+        # so this is the same yield it would divide
+        budgets.append(
+            bins_for_background(
+                cells.total_bkg(xlo, xhi, 1, cells.ny),
+                max_bins,
+                knobs["bkg_per_bin"],
+            )
+        )
+
+    if knobs["dp_budget_mode"] == "shared":
+        counts = allocate_budget(
+            [values for values, _ in curves], sum(budgets), n_min=1, n_max=max_bins
+        )
+        if counts is None:
+            counts = [None] * len(slices)
+    else:
+        counts = [None] * len(slices)
+
+    chosen = [
+        _best_count(values, counts[i] if counts[i] is not None else budgets[i])
+        for i, (values, _) in enumerate(curves)
+    ]
+    reference = sum(curves[i][0][n] for i, n in enumerate(chosen) if n is not None)
+    if knobs["dp_min_bin_gain"] > 0 and reference > 0:
+        chosen = [
+            None if n is None else m
+            for n, m in zip(
+                chosen,
+                trim_by_marginal_gain(
+                    [values for values, _ in curves],
+                    [n if n is not None else 1 for n in chosen],
+                    knobs["dp_min_bin_gain"] * reference,
+                ),
+            )
+        ]
+
+    partitions = []
+    for idx, (values, ranges) in enumerate(curves):
+        n = chosen[idx]
+        if n is None:
+            # Not even one bin covering the whole mass axis clears the gates. The greedy
+            # path keeps such a slice anyway, and matching that is deliberate:
+            # merge_until_valid() loops `while len(ranges) > 1`, so once it has merged
+            # down to a single range it returns it *without* testing it. Refusing here
+            # instead would drop categories that production currently builds, and since
+            # every mass point has to share one category list, dropping one at one mass
+            # is not a stricter binning, it is a broken datacard.
+            partitions.append([(1, cells.ny)])
+        else:
+            partitions.append(list(ranges[n]))
+    return partitions
+
+
+def _x_step(cells, partitions, knobs, exempt_full):
+    """Re-place the slice boundaries with the mass binnings held fixed.
+
+    Exact over the whole partition, which is the difference from grow_slice(): that picks
+    each boundary to maximise the significance of the one slice it is closing off, taking
+    no view on what the remaining axis will be worth. Here every boundary is chosen
+    against the total.
+
+    Returns ranges already widened into under/overflow, because slice_axis_tables() scored
+    them that way -- the outermost slices are worth what they are worth *with* the events
+    that will be written into them.
+    """
+    score, valid = slice_axis_tables(
+        cells, partitions, knobs, knobs["significance_mode"], exempt_full
+    )
+    parts = partition_dp_staged(score, valid, len(partitions))
+    if parts is None:
+        return None
+    slices = [(i + 1, j + 1) for i, j in parts]
+    return extend_outer_edges(slices, 0, cells.nx + 1)
+
+
+def _objective(cells, slices, partitions, mode):
+    """Total Z^2 of a binning, scored on the ranges that would actually be written."""
+    return sum(
+        cells.score(xlo, xhi, a, b, mode)
+        for (xlo, xhi), partition in zip(slices, partitions)
+        for a, b in partition
+    )
+
+
 def _discover_dp(sig2d, bkg2d_by_name, knobs):
-    """Slices as the greedy path places them; mass bins by exact search.
+    """Both axes, alternated until neither can improve the other.
 
-    The slice boundaries are still find_slices(): this step changes how the bins inside a
-    slice are chosen and how many each slice gets, and leaving the x axis alone is what
-    makes the two comparable.
+    Seeded from the greedy slice boundaries plus one mass-axis pass, which is what makes
+    the result at least as good as the greedy binning rather than merely different: the
+    seed is a feasible point, and nothing below is ever accepted unless it scores higher.
 
-    With dp_budget_mode "shared" the per-slice budgets are pooled and redistributed by
-    what a bin is worth rather than by where the background happens to sit.
+    Each step is an exact maximisation of the same total given the other axis, so this is
+    block coordinate ascent with globally optimal coordinate steps -- not a heuristic
+    relaxation. It converges to a point where neither axis can improve on the other, which
+    is not necessarily the global optimum of the pair.
 
-    The pool is the total bin_budget() *licenses*, which is not the same as the number of
-    bins the greedy path ends up with: merge_until_valid() hands bins back whenever the
-    quantile edges it proposed fail the gates, so greedy routinely spends less than its
-    own budget. An exact search finds valid partitions at counts where the quantile edges
-    happened not to be valid, so "the same licensed total" can still come out as more fit
-    bins than greedy produced -- measured at 37 against 31 in eMu/SR/res2b at MX=800.
-    Worth stating plainly, because it means this strategy is not automatically neutral on
-    the over-binning question that set bkg_per_bin, and cannot be waved through on the
-    grounds that it only moves bins around. What it does guarantee is that every bin it
-    writes passes the same gates, and that no bin is spent where it buys nothing.
+    The accept test is on the objective as finally scored, not on whatever each step
+    maximised internally. The two are almost the same thing but not exactly: the mass-axis
+    step deliberately judges its gates over y = 1..ny to match the greedy path, while the
+    written bins carry the y under/overflow. Comparing the realised objective makes the
+    ascent monotone whatever those conventions are, instead of relying on them agreeing.
     """
     any_hist = next(iter(bkg2d_by_name.values()))[0]
     nx = any_hist.GetNbinsX()
@@ -525,70 +625,37 @@ def _discover_dp(sig2d, bkg2d_by_name, knobs):
     slices = extend_outer_edges(slices, 0, nx + 1)
 
     cells = build_cells(sig2d, bkg2d_by_name)
-    max_bins = knobs["max_bins_per_slice"]
-    curves, budgets = [], []
-    for xlo, xhi in slices:
-        values, ranges = _slice_dp_curve(cells, xlo, xhi, knobs, max_bins)
-        curves.append((values, ranges))
-        # y = 1..ny for the same reason as in _slice_dp_curve: bin_budget() is handed a
-        # ProjectionY and asked for (1, ny), so this is the same yield it would divide.
-        budgets.append(
-            bins_for_background(
-                cells.total_bkg(xlo, xhi, 1, cells.ny),
-                max_bins,
-                knobs["bkg_per_bin"],
-            )
-        )
+    mode = knobs["significance_mode"]
+    # the slice gates use the exempt set judged once over the whole axis, as find_slices
+    # does -- a background negligible in this category must not veto every boundary
+    exempt_full = cells.exempt(1, nx, 0, cells.ny + 1, knobs["min_bkg_frac"])
 
-    if knobs["dp_budget_mode"] == "shared":
-        counts = allocate_budget(
-            [values for values, _ in curves], sum(budgets), n_min=1, n_max=max_bins
-        )
-        if counts is None:
-            counts = [None] * len(slices)
-    else:
-        counts = [None] * len(slices)
+    partitions = _y_step(cells, slices, knobs)
+    best = _objective(cells, slices, partitions, mode)
+    iterations = 0
 
-    # Whatever the budget allowed, drop the bins that did not pay for themselves. The
-    # reference is the total the slices would reach unconstrained, so the threshold means
-    # the same thing to a slice carrying 0.1% of the category and one carrying 89%.
-    chosen = [
-        _best_count(values, counts[i] if counts[i] is not None else budgets[i])
-        for i, (values, _) in enumerate(curves)
+    for _ in range(max(0, knobs["dp_max_iterations"])):
+        moved = _x_step(cells, partitions, knobs, exempt_full)
+        if moved is None or moved == slices:
+            break
+        candidate = _y_step(cells, moved, knobs)
+        value = _objective(cells, moved, candidate, mode)
+        # strict improvement, not "the partition changed": the objective is what is
+        # guaranteed to be monotone, the partition is not, and ties can cycle forever
+        if value <= best * (1.0 + 1e-12):
+            break
+        slices, partitions, best = moved, candidate, value
+        iterations += 1
+
+    if iterations:
+        print(f"      [dp] slice boundaries re-placed {iterations}x, Z^2 {best:.4f}")
+    return [
+        {
+            "x_range": (xlo, xhi),
+            "y_ranges": extend_outer_edges(list(partition), 0, cells.ny + 1),
+        }
+        for (xlo, xhi), partition in zip(slices, partitions)
     ]
-    reference = sum(curves[i][0][n] for i, n in enumerate(chosen) if n is not None)
-    if knobs["dp_min_bin_gain"] > 0 and reference > 0:
-        gain_floor = knobs["dp_min_bin_gain"] * reference
-        chosen = [
-            None if n is None else m
-            for n, m in zip(
-                chosen,
-                trim_by_marginal_gain(
-                    [values for values, _ in curves],
-                    [n if n is not None else 1 for n in chosen],
-                    gain_floor,
-                ),
-            )
-        ]
-
-    result = []
-    for idx, (xlo, xhi) in enumerate(slices):
-        values, ranges = curves[idx]
-        n = chosen[idx]
-        if n is None:
-            # Not even one bin covering the whole mass axis clears the gates. The greedy
-            # path keeps such a slice anyway, and not by accident that is worth matching:
-            # merge_until_valid() loops `while len(ranges) > 1`, so once it has merged
-            # down to a single range it returns it *without* testing it. Refusing here
-            # instead would drop categories that production currently builds, and since
-            # every mass point has to share one category list, dropping one at one mass
-            # is not a stricter binning, it is a broken datacard.
-            bin_ranges = [(1, cells.ny)]
-        else:
-            bin_ranges = list(ranges[n])
-        bin_ranges = extend_outer_edges(bin_ranges, 0, cells.ny + 1)
-        result.append({"x_range": (xlo, xhi), "y_ranges": bin_ranges})
-    return result
 
 
 def discover_binning(sig2d, bkg2d_by_name, knobs):

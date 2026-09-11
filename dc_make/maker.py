@@ -1,4 +1,5 @@
 import itertools
+import json
 import math
 import os
 import yaml
@@ -67,7 +68,7 @@ class DatacardMaker:
         # ("SR/res2b_dnn0"), and `category_pattern` is how they are taken apart again to
         # group the slices of one base category.
         self.naming = CategoryNaming.fromConfig(cfg)
-        self.categories = list(cfg["categories"])
+        self.categories = self._resolveCategories(list(cfg["categories"]))
         self.signalFractionForRelevantBins = cfg["signalFractionForRelevantBins"]
 
         self.era_groups = cfg.get("era_groups", {})
@@ -162,6 +163,84 @@ class DatacardMaker:
         self._merged_away = {}
         self.shapes = {}
         self.signal_hists_by_key = {}
+
+    def _resolveCategories(self, declared):
+        """The datacard bins, expanded from base categories when the shapes were sliced.
+
+        A configuration may list either the sliced names ("SR/res2b_dnn0".."dnn3") or the
+        base ones ("SR/res2b"). Listing the sliced names means the slice count is written
+        down in two files that have to agree -- the binning yaml decides it, the datacard
+        yaml repeats it -- and changing it in one alone produces a datacard hunting for a
+        category the binner never wrote, or missing one it did. So base names are expanded
+        here instead, against the binning record that the run which produced these shapes
+        left beside them.
+
+        binning.json is the right source because it is a product of that run: it says what
+        was actually written, not what some configuration intended. A category the binner
+        skipped everywhere is dropped rather than looked for.
+
+        Input with no binning.json is not sliced -- a configuration with no `preprocess:`
+        block reads the merged histograms directly -- and its categories are used exactly
+        as declared. That is the SL card's case and this must not disturb it.
+        """
+        record_path = os.path.join(self.input_path, "binning.json")
+        sliced = [c for c in declared if self.naming.split(c)[1] is not None]
+        if sliced and len(sliced) != len(declared):
+            raise RuntimeError(
+                "categories: mixes sliced names "
+                f"({', '.join(sliced[:3])}...) with base names "
+                f"({', '.join(c for c in declared if c not in sliced)}). One or the "
+                "other: base names are expanded against the binning record, sliced names "
+                "are taken as written, and a mixture would silently produce both."
+            )
+        if sliced or not os.path.exists(record_path):
+            return declared
+
+        with open(record_path, "r") as f:
+            record = json.load(f)
+
+        # The record names the pattern it wrote with. If it disagrees with this
+        # configuration's, expanding would build names the shapes are not stored under --
+        # and the failure would surface much later as a missing histogram.
+        recorded_pattern = record.get("category_pattern")
+        if recorded_pattern is not None and recorded_pattern != self.naming.pattern:
+            raise RuntimeError(
+                f"{record_path} wrote its categories with category_pattern "
+                f"'{recorded_pattern}', but this configuration declares "
+                f"'{self.naming.pattern}'. They name the same categories from the two "
+                "ends and have to be identical."
+            )
+
+        counts = {}
+        for by_mass in record.get("binning", {}).values():
+            for by_channel in by_mass.values():
+                for by_category in by_channel.values():
+                    for category, entry in by_category.items():
+                        counts.setdefault(category, set()).add(len(entry["slices"]))
+
+        resolved = []
+        for base in declared:
+            seen = counts.get(base)
+            if not seen:
+                print(
+                    f"[categories] {base} is in the configuration but in no entry of "
+                    f"{record_path}, so the binning skipped it everywhere and there are "
+                    "no shapes for it; dropping it from the datacard."
+                )
+                continue
+            if len(seen) != 1:
+                # Every mass point has to offer the same category list, or the datacards
+                # are not a set. If the record disagrees with itself about how many slices
+                # a category has, saying so here is far cheaper than a card that builds
+                # for some masses and not others.
+                raise RuntimeError(
+                    f"{record_path} records {sorted(seen)} slices for {base} in different "
+                    "era/mass/channel entries. Every mass point must share one category "
+                    "list, so this binning cannot be turned into a consistent set of "
+                    "datacards."
+                )
+            resolved.extend(self.naming.name(base, i) for i in range(seen.pop()))
+        return resolved
 
     def getBin(self, era, channel, category, return_name=True, return_index=True):
         name = f"{era}_{self.analysis}_{channel}_{category}"

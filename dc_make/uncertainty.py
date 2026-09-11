@@ -53,7 +53,7 @@ class Uncertainty:
             (Uncertainty.hasMatch(process.name, self.processes) or match_subprocess)
             and Uncertainty.hasMatch(era, self.eras)
             and Uncertainty.hasMatch(channel, self.channels)
-            and Uncertainty.hasMatch(category, self.categories)
+            and Uncertainty.hasCategoryMatch(category, self.categories)
         )
 
     def resolveType(
@@ -82,6 +82,32 @@ class Uncertainty:
         hist_b.Divide(hist_a)
         _, p_value, _, _ = Uncertainty.fitFlat(hist_b)
         return p_value > p_thr
+
+    @staticmethod
+    def hasCategoryMatch(category, patterns):
+        """hasMatch(), but a base category also covers the slices cut from it.
+
+        Process.appliesToCategory already works this way, with the reasoning that how many
+        slices a category is cut into is a binning parameter and the configuration should
+        not have to change when it does. An uncertainty scoped to "SR/boosted" was not
+        getting the same treatment: hasMatch() compares for equality, so it would have
+        matched nothing at all once the shapes were sliced into SR/boosted_dnn0..3 -- an
+        uncertainty silently applying nowhere, which no error would have reported. Nothing
+        in the bbWW DL card is category-scoped today, so this fixes a trap rather than a
+        bug.
+
+        The separator is required, so that "SR/boosted" cannot also swallow "SR/boosted2".
+        Regex patterns keep their own meaning and are left to hasMatch().
+        """
+        if len(patterns) == 0:
+            return True
+        for pattern in patterns:
+            if pattern[0] == "^":
+                if re.match(pattern, category):
+                    return True
+            elif category == pattern or category.startswith(pattern + "_"):
+                return True
+        return False
 
     @staticmethod
     def hasMatch(value, patterns):

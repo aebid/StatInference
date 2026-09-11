@@ -1,7 +1,10 @@
+import math
 import array
 import json
 import os
 import sys
+
+import numpy as np
 import yaml
 
 if __name__ == "__main__":
@@ -29,6 +32,7 @@ from StatInference.common.binning_core import (
     _total_bkg_error,
     bin_budget,
     bin_edges,
+    bins_for_background,
     effective_entries,
     extend_outer_edges,
     find_slices,
@@ -38,6 +42,15 @@ from StatInference.common.binning_core import (
     minor_backgrounds,
     open_input_file,
     sum_hists,
+)
+from StatInference.common.binning_dp import (
+    allocate_budget,
+    binning_objective,
+    build_cells,
+    check_mask_against_gate,
+    partition_dp,
+    slice_tables,
+    trim_by_marginal_gain,
 )
 
 ROOT = importROOT()
@@ -65,7 +78,29 @@ BINNING_DEFAULTS = {
     "min_bkg_frac": 0.05,
     "min_signal": 0.5,
     "significance_mode": "asimov",
+    # How the edges are found. "greedy" is the original: each slice boundary is the best
+    # one taken on its own, and the mass bins inside a slice are equal-signal quantiles
+    # merged until the gates pass. "dp" replaces the mass axis with an exact partition
+    # search against the same figure of merit the slice boundaries already use. Default
+    # stays "greedy" so adding this moves nothing until a configuration asks for it.
+    "strategy": "greedy",
+    # "per_slice" gives each slice the bins bin_budget() licenses from its own
+    # background, which is what production does. "shared" pools those into one total and
+    # spends it where it buys the most Z^2 -- the same number of bins, distributed by
+    # what they are worth rather than by where the background happens to be.
+    "dp_budget_mode": "per_slice",
+    # A bin must earn its place: the split that creates it has to raise this category's
+    # Z^2 by at least this fraction of the category's own achievable total, or it is given
+    # back. 0.0 leaves the count to the budget alone, which is the previous behaviour.
+    "dp_min_bin_gain": 0.0,
 }
+
+# Named here so the yaml path can be checked against the same list the command line's
+# choices= uses -- significance_mode already learned this lesson: it is read by a
+# function that silently treats anything unrecognised as a default, so a typo in the
+# yaml quietly changed the answer instead of failing.
+BINNING_STRATEGIES = ("greedy", "dp")
+BUDGET_MODES = ("per_slice", "shared")
 
 
 def load_binning_config(path, overrides=None):
@@ -97,6 +132,15 @@ def load_binning_config(path, overrides=None):
             f"{path or 'binning configuration'}: significance_mode "
             f"'{knobs['significance_mode']}' is not one of {sorted(SIGNIFICANCE_MODES)}."
         )
+    for key, allowed in (
+        ("strategy", BINNING_STRATEGIES),
+        ("dp_budget_mode", BUDGET_MODES),
+    ):
+        if knobs[key] not in allowed:
+            raise RuntimeError(
+                f"{path or 'binning configuration'}: {key} '{knobs[key]}' is not one of "
+                f"{sorted(allowed)}."
+            )
     return knobs
 
 
@@ -284,22 +328,7 @@ def find_bins(
     )
 
 
-def discover_binning(
-    sig2d,
-    bkg2d_by_name,
-    n_slices,
-    max_bins_per_slice,
-    min_slice_sum,
-    min_bin_each,
-    min_slice_bkg_neff=0.0,
-    min_bkg_frac=0.0,
-    min_bin_bkg_neff=0.0,
-    bkg_per_bin=0.0,
-    sig_mode="sb",
-    min_slice_bkg_each=0.0,
-    min_slice_bkg_each_neff=0.0,
-    min_bin_bkg_each_neff=0.0,
-):
+def _discover_greedy(sig2d, bkg2d_by_name, knobs):
     """bkg2d_by_name: {background_name: [hist per discovery era, ...]}. The list
     is usually a single era's own histogram (standalone limit) or all of a
     meta-era's sub-eras (combined limit) -- see --discovery-eras.
@@ -307,6 +336,19 @@ def discover_binning(
     the same discovery reference's (already-summed) signal histogram: its x
     projection picks the significance-maximizing slice boundaries, and its y
     projection within each slice places the mass bin edges by signal quantile."""
+    n_slices = knobs["n_slices"]
+    max_bins_per_slice = knobs["max_bins_per_slice"]
+    min_slice_sum = knobs["min_slice_bkg_sum"]
+    min_bin_each = knobs["min_bin_bkg_each"]
+    min_slice_bkg_neff = knobs["min_slice_bkg_neff"]
+    min_bkg_frac = knobs["min_bkg_frac"]
+    min_bin_bkg_neff = knobs["min_bin_bkg_neff"]
+    bkg_per_bin = knobs["bkg_per_bin"]
+    sig_mode = knobs["significance_mode"]
+    min_slice_bkg_each = knobs["min_slice_bkg_each"]
+    min_slice_bkg_each_neff = knobs["min_slice_bkg_each_neff"]
+    min_bin_bkg_each_neff = knobs["min_bin_bkg_each_neff"]
+
     any_hist = next(iter(bkg2d_by_name.values()))[0]
     nx = any_hist.GetNbinsX()
     ny = any_hist.GetNbinsY()
@@ -361,6 +403,207 @@ def discover_binning(
         bin_ranges = extend_outer_edges(bin_ranges, 0, ny + 1)
         result.append({"x_range": (xlo, xhi), "y_ranges": bin_ranges})
     return result
+
+
+def _slice_dp_curve(cells, xlo, xhi, knobs, max_bins, check=True):
+    """For one slice, the best mass-axis partition at every bin count up to max_bins.
+
+    The edges come from an exact search against the same figure of merit that already
+    chooses the slice boundaries, instead of from equal-signal quantiles. The quantile
+    rule put the edges where the signal is, which is right as far as it goes and was a
+    real improvement over scanning the axis from the top -- but it never looks at the
+    background, so it cannot tell the steep side of the resonance from the flat one, and
+    it cannot decline a split that gains nothing.
+
+    Validity is a mask on the search rather than a term in the score: a bin whose
+    background has gone negative is not a bad bin to be outweighed, it is one the
+    datacard cannot contain.
+
+    `exempt` is judged once over this slice's whole mass range, never inside the
+    candidate bin -- see minor_backgrounds(); judging it per candidate is circular,
+    because a background that is zero in the bin under test is trivially below any
+    fraction of that bin's total.
+
+    y = 1..ny, *not* the full axis, because that is the range the greedy path judges this
+    on: it works from ProjectionY histograms and calls minor_backgrounds(h, 1, ny), so the
+    y under/overflow rows are outside the fraction. They are inside the bins that
+    eventually get written -- extend_outer_edges pushes them into the first and last -- so
+    the two are not quite the same question. Matching the greedy path is deliberate: the
+    point of this strategy is to change how the edges are chosen, and a quietly different
+    exempt set would mean the comparison was measuring two things at once.
+    """
+    ny = cells.ny
+    exempt = cells.exempt(xlo, xhi, 1, ny, knobs["min_bkg_frac"])
+    mode = knobs["significance_mode"]
+
+    def bin_passes(x0, x1, a, b, exempt_set):
+        """The canonical gate, for the cross-check below -- and the definition the
+        vectorised tables have to agree with."""
+        return _bin_passes(
+            cells.yields(x0, x1, a, b),
+            knobs["min_bin_bkg_each"],
+            exempt_set,
+            cells.total_bkg_error(x0, x1, a, b),
+            knobs["min_bin_bkg_neff"],
+            cells.errors(x0, x1, a, b),
+            knobs["min_bin_bkg_each_neff"],
+        )
+
+    score, valid = slice_tables(cells, xlo, xhi, exempt, knobs, mode)
+    if check:
+        check_mask_against_gate(cells, xlo, xhi, valid, score, exempt, bin_passes, mode)
+    values, partitions = partition_dp(score, valid, max_bins)
+    # back from working indices to bin numbers
+    ranges = [None if p is None else [(a + 1, b + 1) for a, b in p] for p in partitions]
+    return values, ranges
+
+
+def _best_count(values, cap):
+    """The bin count at or below `cap` that actually scores best, or None if none is
+    feasible.
+
+    Not the largest feasible count, which is the obvious choice and the wrong one. With
+    the background uncertainty folded into the figure of merit -- which is what
+    significance() does, and the reason it does not reward a background that fluctuated
+    low -- splitting a bin is no longer guaranteed to raise Z^2: each half carries a
+    larger relative sigma_B, and for a slice that is already statistics-limited the
+    split can cost more than the extra shape information gains. Taking the largest
+    feasible count would then hand back a binning worse than the greedy one it is
+    supposed to improve on.
+
+    Choosing the argmax instead makes "at least as good as greedy" true by construction
+    rather than by hope: greedy's own partition uses some count m <= cap and passes the
+    same gates, so values[m] is one of the candidates here and the winner is at least
+    that. It also tends to spend fewer bins than the budget allows, which is the right
+    direction -- an extra bin that buys nothing is pure MC-statistical exposure.
+    """
+    best, best_n = -np.inf, None
+    for n in range(1, min(cap, len(values) - 1) + 1):
+        if values[n] > best:
+            best, best_n = values[n], n
+    return best_n
+
+
+def _discover_dp(sig2d, bkg2d_by_name, knobs):
+    """Slices as the greedy path places them; mass bins by exact search.
+
+    The slice boundaries are still find_slices(): this step changes how the bins inside a
+    slice are chosen and how many each slice gets, and leaving the x axis alone is what
+    makes the two comparable.
+
+    With dp_budget_mode "shared" the per-slice budgets are pooled and redistributed by
+    what a bin is worth rather than by where the background happens to sit.
+
+    The pool is the total bin_budget() *licenses*, which is not the same as the number of
+    bins the greedy path ends up with: merge_until_valid() hands bins back whenever the
+    quantile edges it proposed fail the gates, so greedy routinely spends less than its
+    own budget. An exact search finds valid partitions at counts where the quantile edges
+    happened not to be valid, so "the same licensed total" can still come out as more fit
+    bins than greedy produced -- measured at 37 against 31 in eMu/SR/res2b at MX=800.
+    Worth stating plainly, because it means this strategy is not automatically neutral on
+    the over-binning question that set bkg_per_bin, and cannot be waved through on the
+    grounds that it only moves bins around. What it does guarantee is that every bin it
+    writes passes the same gates, and that no bin is spent where it buys nothing.
+    """
+    any_hist = next(iter(bkg2d_by_name.values()))[0]
+    nx = any_hist.GetNbinsX()
+    slices = find_slices(
+        sig2d,
+        bkg2d_by_name,
+        knobs["n_slices"],
+        1,
+        nx,
+        knobs["min_slice_bkg_sum"],
+        knobs["min_slice_bkg_neff"],
+        knobs["significance_mode"],
+        knobs["min_slice_bkg_each"],
+        knobs["min_slice_bkg_each_neff"],
+        knobs["min_bkg_frac"],
+    )
+    if any(sl is None for sl in slices):
+        return None
+    slices = extend_outer_edges(slices, 0, nx + 1)
+
+    cells = build_cells(sig2d, bkg2d_by_name)
+    max_bins = knobs["max_bins_per_slice"]
+    curves, budgets = [], []
+    for xlo, xhi in slices:
+        values, ranges = _slice_dp_curve(cells, xlo, xhi, knobs, max_bins)
+        curves.append((values, ranges))
+        # y = 1..ny for the same reason as in _slice_dp_curve: bin_budget() is handed a
+        # ProjectionY and asked for (1, ny), so this is the same yield it would divide.
+        budgets.append(
+            bins_for_background(
+                cells.total_bkg(xlo, xhi, 1, cells.ny),
+                max_bins,
+                knobs["bkg_per_bin"],
+            )
+        )
+
+    if knobs["dp_budget_mode"] == "shared":
+        counts = allocate_budget(
+            [values for values, _ in curves], sum(budgets), n_min=1, n_max=max_bins
+        )
+        if counts is None:
+            counts = [None] * len(slices)
+    else:
+        counts = [None] * len(slices)
+
+    # Whatever the budget allowed, drop the bins that did not pay for themselves. The
+    # reference is the total the slices would reach unconstrained, so the threshold means
+    # the same thing to a slice carrying 0.1% of the category and one carrying 89%.
+    chosen = [
+        _best_count(values, counts[i] if counts[i] is not None else budgets[i])
+        for i, (values, _) in enumerate(curves)
+    ]
+    reference = sum(curves[i][0][n] for i, n in enumerate(chosen) if n is not None)
+    if knobs["dp_min_bin_gain"] > 0 and reference > 0:
+        gain_floor = knobs["dp_min_bin_gain"] * reference
+        chosen = [
+            None if n is None else m
+            for n, m in zip(
+                chosen,
+                trim_by_marginal_gain(
+                    [values for values, _ in curves],
+                    [n if n is not None else 1 for n in chosen],
+                    gain_floor,
+                ),
+            )
+        ]
+
+    result = []
+    for idx, (xlo, xhi) in enumerate(slices):
+        values, ranges = curves[idx]
+        n = chosen[idx]
+        if n is None:
+            # Not even one bin covering the whole mass axis clears the gates. The greedy
+            # path keeps such a slice anyway, and not by accident that is worth matching:
+            # merge_until_valid() loops `while len(ranges) > 1`, so once it has merged
+            # down to a single range it returns it *without* testing it. Refusing here
+            # instead would drop categories that production currently builds, and since
+            # every mass point has to share one category list, dropping one at one mass
+            # is not a stricter binning, it is a broken datacard.
+            bin_ranges = [(1, cells.ny)]
+        else:
+            bin_ranges = list(ranges[n])
+        bin_ranges = extend_outer_edges(bin_ranges, 0, cells.ny + 1)
+        result.append({"x_range": (xlo, xhi), "y_ranges": bin_ranges})
+    return result
+
+
+def discover_binning(sig2d, bkg2d_by_name, knobs):
+    """Find this category's binning, by whichever strategy the configuration names.
+
+    bkg2d_by_name: {background_name: [hist per discovery era, ...]}. The list is usually
+    a single era's own histogram (standalone limit) or all of a meta-era's sub-eras
+    (combined limit). Yields are summed across whatever is in the list; see _bkg_yields().
+    sig2d is the same discovery reference's already-summed signal histogram.
+
+    Returns None when the category cannot be binned, which the caller reports as a skip.
+    """
+    if knobs["strategy"] == "dp":
+        return _discover_dp(sig2d, bkg2d_by_name, knobs)
+    return _discover_greedy(sig2d, bkg2d_by_name, knobs)
 
 
 def mkdir_titled(directory, path, title):
@@ -420,14 +663,20 @@ def slice_ranges(x_axis, slices):
     return ranges
 
 
-def slices_to_record(slices, x_axis, y_axis):
+def slices_to_record(slices, x_axis, y_axis, objective=None):
     """The discovered structure as plain data, for binning.json.
 
     Both forms are written. The bin index ranges are what the code actually cuts on and
     are what a replay restores; the physical edges alongside them are what a human reads,
     and what makes the record meaningful next to a plot.
+
+    `objective` is what the binning scored, recomputed from these ranges rather than
+    carried out of the optimiser -- so it is filled in for the greedy strategy too, which
+    never computes it, and two runs can be compared from their records alone. It is
+    written as a sibling of the slices and never read back: record_to_slices() takes only
+    the ranges, so a record written before this existed still replays.
     """
-    return {
+    record = {
         "n_x_bins": x_axis.GetNbins(),
         "n_y_bins": y_axis.GetNbins(),
         "slices": [
@@ -440,6 +689,15 @@ def slices_to_record(slices, x_axis, y_axis):
             for sl, x_edges in zip(slices, slice_ranges(x_axis, slices))
         ],
     }
+    if objective is not None:
+        total, per_slice = objective
+        record["objective"] = {
+            "z": math.sqrt(max(total, 0.0)),
+            "z2": total,
+            "z2_per_slice": per_slice,
+            "n_bins": sum(len(sl["y_ranges"]) for sl in slices),
+        }
+    return record
 
 
 def record_to_slices(record, x_axis, y_axis, where):
@@ -602,22 +860,7 @@ def process_category(
             frozen, disc_sig.GetXaxis(), disc_sig.GetYaxis(), where
         )
     else:
-        slices = discover_binning(
-            disc_sig,
-            disc_bkg_by_name,
-            knobs["n_slices"],
-            knobs["max_bins_per_slice"],
-            knobs["min_slice_bkg_sum"],
-            knobs["min_bin_bkg_each"],
-            knobs["min_slice_bkg_neff"],
-            knobs["min_bkg_frac"],
-            knobs["min_bin_bkg_neff"],
-            knobs["bkg_per_bin"],
-            knobs["significance_mode"],
-            knobs["min_slice_bkg_each"],
-            knobs["min_slice_bkg_each_neff"],
-            knobs["min_bin_bkg_each_neff"],
-        )
+        slices = discover_binning(disc_sig, disc_bkg_by_name, knobs)
         if slices is None:
             print(
                 f"    [skip] {channel}/{category} {param_name}={mass}: the "
@@ -655,7 +898,21 @@ def process_category(
                 out_file.cd(f"{channel}/{naming.name(category, slice_idx)}")
                 h.Write(key)
 
-    return slices_to_record(slices, disc_sig.GetXaxis(), disc_sig.GetYaxis())
+    # Scored from the ranges that were just written, for both strategies and for a replay
+    # alike, so the number in the record always describes the shapes beside it. Cheap
+    # next to the search, and the greedy path has no other way to report what it achieved.
+    # Only when there is something to score. A replay is allowed to proceed with a
+    # background missing from the input -- it applies recorded edges and asks no
+    # questions -- and a figure of merit computed against no background would be a
+    # number, but not a true one.
+    objective = (
+        binning_objective(
+            build_cells(disc_sig, disc_bkg_by_name), slices, knobs["significance_mode"]
+        )
+        if disc_bkg_by_name
+        else None
+    )
+    return slices_to_record(slices, disc_sig.GetXaxis(), disc_sig.GetYaxis(), objective)
 
 
 def run(
@@ -927,6 +1184,25 @@ if __name__ == "__main__":
             help=help_text,
         )
     parser.add_argument(
+        "--strategy",
+        required=False,
+        type=str,
+        default=None,
+        choices=list(BINNING_STRATEGIES),
+        help="how the edges are found: 'greedy' = each slice boundary taken on its own "
+        "and equal-signal quantiles inside it, 'dp' = an exact partition search on the "
+        "mass axis against the same figure of merit",
+    )
+    parser.add_argument(
+        "--dp-budget-mode",
+        required=False,
+        type=str,
+        default=None,
+        choices=list(BUDGET_MODES),
+        help="'per_slice' gives each slice the bins its own background licenses; "
+        "'shared' pools the same total and spends it where it buys the most (dp only)",
+    )
+    parser.add_argument(
         "--significance-mode",
         required=False,
         type=str,
@@ -939,6 +1215,8 @@ if __name__ == "__main__":
 
     overrides = {name: getattr(args, name) for name in knob_args}
     overrides["significance_mode"] = args.significance_mode
+    overrides["strategy"] = args.strategy
+    overrides["dp_budget_mode"] = args.dp_budget_mode
     knobs = load_binning_config(args.binning_config, overrides)
 
     frozen_binning = None

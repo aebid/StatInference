@@ -460,6 +460,18 @@ def bin_budget(bkg_hists_by_name, lo, hi, max_bins_per_slice, bkg_per_bin):
     if bkg_per_bin <= 0:
         return max_bins_per_slice
     total = sum(_bkg_yields(bkg_hists_by_name, lo, hi).values())
+    return bins_for_background(total, max_bins_per_slice, bkg_per_bin)
+
+
+def bins_for_background(total, max_bins_per_slice, bkg_per_bin):
+    """bin_budget()'s arithmetic, separated from how the yield was obtained.
+
+    The cell-table binner has the slice's background already and would otherwise have to
+    restate this formula to avoid re-projecting the histograms -- and a second statement
+    of it is a second thing to keep in step. This is the only copy.
+    """
+    if bkg_per_bin <= 0:
+        return max_bins_per_slice
     if total <= 0:
         return 1
     return max(1, min(max_bins_per_slice, int(total / bkg_per_bin)))

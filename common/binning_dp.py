@@ -114,13 +114,20 @@ class Cells:
         self._sig = _prefix(sig)
         self._bkg = {name: _prefix(bkg[name]) for name in self.names}
         self._var = {name: _prefix(var[name]) for name in self.names}
-        self._bkg_tot = _prefix(sum(bkg.values()))
-        self._var_tot = _prefix(sum(var.values()))
+        # An empty background dict is reachable -- a replay whose input is missing a
+        # process it was derived with -- and sum() of nothing is the integer 0, which is
+        # not an array. Zeros keep every query defined and answering zero, which is the
+        # truthful answer when there is no background to integrate.
+        zero = np.zeros_like(sig)
+        bkg_tot = sum(bkg.values()) if bkg else zero
+        var_tot = sum(var.values()) if var else zero
+        self._bkg_tot = _prefix(bkg_tot)
+        self._var_tot = _prefix(var_tot)
         self._eps_sig = _cancellation_eps(sig)
         self._eps_bkg = {name: _cancellation_eps(bkg[name]) for name in self.names}
-        self._eps_tot = _cancellation_eps(sum(bkg.values()))
+        self._eps_tot = _cancellation_eps(bkg_tot)
         self._eps_var = {name: _cancellation_eps(var[name]) for name in self.names}
-        self._eps_var_tot = _cancellation_eps(sum(var.values()))
+        self._eps_var_tot = _cancellation_eps(var_tot)
 
     # -- the whole y axis, under- and overflow included: what a slice-level query means
     def full_y(self):
@@ -510,3 +517,196 @@ if __name__ == "__main__":
     n_part, n_alloc = _self_test()
     print(f"partition_dp:    {n_part} (n, k) cases vs exhaustive enumeration -- OK")
     print(f"allocate_budget: {n_alloc} cases vs exhaustive enumeration -- OK")
+
+
+def binning_objective(cells, slices, mode):
+    """(total Z^2, per-slice Z^2) for a finished binning.
+
+    The quantity the search maximises, recomputed from the binning that was actually
+    written rather than carried out of the optimiser. That makes it meaningful for the
+    greedy strategy too -- which never computes it -- so the two can be compared from
+    their binning.json alone, and it means a discrepancy between what the optimiser
+    thought it achieved and what the shapes contain shows up as a discrepancy rather
+    than going unnoticed.
+
+    Note this is evaluated on the ranges as recorded, i.e. after extend_outer_edges has
+    pushed the outermost ones into under/overflow, so it describes the shapes on disk.
+    """
+    per_slice = []
+    for sl in slices:
+        xlo, xhi = sl["x_range"]
+        per_slice.append(
+            sum(cells.score(xlo, xhi, ylo, yhi, mode) for ylo, yhi in sl["y_ranges"])
+        )
+    return sum(per_slice), per_slice
+
+
+def _ranges_from_column(column, n):
+    """M[i, j] = the rectangle sum for bins (i+1)..(j+1), from one column of a prefix sum.
+
+    For a fixed x window, P[x1+1, :] - P[x0, :] is the running sum along y, and every
+    y range is a difference of two of its entries -- so the whole (n, n) table of
+    candidate ranges is one outer subtraction rather than n^2 lookups.
+    """
+    return column[2 : n + 2][None, :] - column[1 : n + 1][:, None]
+
+
+def _neff_matrix(value, error):
+    """effective_entries() over arrays, with its two degenerate cases kept.
+
+    error <= 0 means the yield carries no MC uncertainty at all: infinite effective
+    entries if there is something there, none if there is not. Taking (v/e)^2 blindly
+    would make the first case a division by zero and the second a nan, and a nan
+    compares false against every threshold -- which would silently reject exactly the
+    empty bins the scalar gate accepts.
+    """
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(error > 0, value / np.where(error > 0, error, 1.0), 0.0) ** 2
+    degenerate = np.where(value > 0, np.inf, 0.0)
+    return np.where(error > 0, ratio, degenerate)
+
+
+def _asimov_z2_matrix(s, b, b_err):
+    """asimov_significance(...)**2 over arrays, matching the scalar branch for branch."""
+    out = np.zeros_like(s)
+    live = (b > 0) & (s > 0)
+    if not live.any():
+        return out
+    var = b_err**2
+    no_err = live & (b_err <= 0)
+    if no_err.any():
+        ss, bb = s[no_err], b[no_err]
+        out[no_err] = np.maximum(2.0 * ((ss + bb) * np.log1p(ss / bb) - ss), 0.0)
+    with_err = live & (b_err > 0)
+    if with_err.any():
+        ss, bb, vv = s[with_err], b[with_err], var[with_err]
+        term1 = (ss + bb) * np.log(((ss + bb) * (bb + vv)) / (bb * bb + (ss + bb) * vv))
+        term2 = (bb * bb / vv) * np.log1p(vv * ss / (bb * (bb + vv)))
+        out[with_err] = np.maximum(2.0 * (term1 - term2), 0.0)
+    return out
+
+
+def _sb_z2_matrix(s, b, b_err):
+    """significance(..., mode="sb")**2 over arrays: S^2 / (B + sigma_B^2)."""
+    denom = b + b_err**2
+    ok = (b > 0) & (denom > 0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(ok, s**2 / np.where(ok, denom, 1.0), 0.0)
+
+
+def slice_tables(cells, x0, x1, exempt, knobs, mode):
+    """(score, valid) over every candidate mass bin of one slice, as (ny, ny) arrays.
+
+    The scalar path -- building a yields dict and an errors dict per candidate and
+    calling _bin_passes -- costs about 80 microseconds a candidate, and there are
+    ny(ny+1)/2 of them per slice. That is minutes per era spent in dict construction, so
+    the arithmetic is done as whole-array operations here instead.
+
+    This is the one place that restates the gate rather than calling it, which is a real
+    risk: two spellings of the same rule are two rules as soon as one of them is edited.
+    It is contained by _check_mask_against_gate(), which re-evaluates the canonical
+    _bin_passes on a random sample of candidates every time these tables are built and
+    raises on the first disagreement -- so the fast path is checked against the slow one
+    on real inputs, on every run, rather than at review time.
+    """
+    ny = cells.ny
+    sig = _ranges_from_column(cells._sig[x1 + 1] - cells._sig[x0], ny)
+    b_tot = _ranges_from_column(cells._bkg_tot[x1 + 1] - cells._bkg_tot[x0], ny)
+    v_tot = _ranges_from_column(cells._var_tot[x1 + 1] - cells._var_tot[x0], ny)
+    b_tot = np.where(np.abs(b_tot) < cells._eps_tot, 0.0, b_tot)
+    err_tot = np.sqrt(np.maximum(v_tot, 0.0))
+
+    valid = np.triu(np.ones((ny, ny), dtype=bool))
+    if knobs["min_bin_bkg_neff"] > 0:
+        valid &= _neff_matrix(b_tot, err_tot) >= knobs["min_bin_bkg_neff"]
+
+    for name in cells.names:
+        b_p = _ranges_from_column(cells._bkg[name][x1 + 1] - cells._bkg[name][x0], ny)
+        b_p = np.where(np.abs(b_p) < cells._eps_bkg[name], 0.0, b_p)
+        # positivity is never exemptable -- see _bin_passes
+        valid &= b_p >= 0
+        if name in exempt:
+            continue
+        valid &= b_p > knobs["min_bin_bkg_each"]
+        if knobs["min_bin_bkg_each_neff"] > 0:
+            v_p = _ranges_from_column(
+                cells._var[name][x1 + 1] - cells._var[name][x0], ny
+            )
+            err_p = np.sqrt(np.maximum(v_p, 0.0))
+            valid &= _neff_matrix(b_p, err_p) >= knobs["min_bin_bkg_each_neff"]
+
+    if mode == "asimov":
+        score = _asimov_z2_matrix(sig, b_tot, err_tot)
+    else:
+        score = _sb_z2_matrix(sig, b_tot, err_tot)
+    score = np.where(valid, score, 0.0)
+    return score, valid
+
+
+def check_mask_against_gate(
+    cells, x0, x1, valid, score, exempt, bin_passes, mode, n_samples=150, seed=0
+):
+    """Re-derive a sample of the vectorised tables with the canonical scalar gate.
+
+    Cheap -- a few hundred calls against the ~11000 the tables replace -- and it is what
+    makes the fast path safe to trust: if slice_tables() and _bin_passes ever disagree
+    about a candidate bin, the run stops here instead of quietly producing a different
+    binning.
+    """
+    ny = cells.ny
+    rng = np.random.default_rng(seed)
+    for _ in range(n_samples):
+        a = int(rng.integers(1, ny + 1))
+        b = int(rng.integers(a, ny + 1))
+        want = bool(bin_passes(x0, x1, a, b, exempt))
+        got = bool(valid[a - 1, b - 1])
+        if got != want:
+            raise AssertionError(
+                f"binning_dp vectorised gate disagrees with _bin_passes on bins "
+                f"{a}..{b} of slice x={x0}..{x1}: fast path says "
+                f"{'valid' if got else 'invalid'}, _bin_passes says "
+                f"{'valid' if want else 'invalid'}. The two spellings of the bin gate "
+                "have drifted; slice_tables() must be brought back in step with it."
+            )
+        if want:
+            expected = cells.score(x0, x1, a, b, mode)
+            if abs(expected - score[a - 1, b - 1]) > 1e-9 * max(abs(expected), 1.0):
+                raise AssertionError(
+                    f"binning_dp vectorised score disagrees with significance() on bins "
+                    f"{a}..{b} of slice x={x0}..{x1}: {score[a - 1, b - 1]!r} vs "
+                    f"{expected!r}."
+                )
+
+
+def trim_by_marginal_gain(values_per_slice, counts, threshold):
+    """Give back every bin whose last split bought less than `threshold`.
+
+    Pooling the budget was supposed to move resolution from the slices that cannot use it
+    to the one that can. Measured over the 90 bbWW DL category-mass problems, it did not:
+    it raised the total bin count 23% and left the top slice's share of Z^2 where it was,
+    because the pool is what bin_budget() *licenses* and that has enough slack for every
+    slice to take more. With Z^2 very nearly monotone in bin count, a search told only to
+    maximise it will always spend whatever it is given.
+
+    So the binding constraint has to be the value of a bin, not the size of a pot. A bin
+    is kept only if the split that created it raised this category's Z^2 by at least
+    `threshold` -- expressed as a fraction of the category's own achievable total, so it
+    means "worth something on the scale that matters here" rather than a yield in events.
+    The lowest DNN slice carries 0.1% of the total Z^2 across hundreds of bins, and every
+    one of those bins is MC-statistical exposure bought for nothing; this is what declines
+    them.
+
+    Stepping down one bin at a time and stopping at the first marginal gain that clears
+    the threshold is exact for a concave curve, which Z^2 in bin count is: each extra
+    split has less left to separate. It is not assumed -- a curve that is not concave
+    simply stops at its first qualifying step, which is still a count whose last bin paid
+    for itself.
+    """
+    if threshold <= 0:
+        return list(counts)
+    trimmed = []
+    for values, n in zip(values_per_slice, counts):
+        while n > 1 and values[n] - values[n - 1] < threshold:
+            n -= 1
+        trimmed.append(n)
+    return trimmed

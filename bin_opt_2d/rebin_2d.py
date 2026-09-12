@@ -99,6 +99,35 @@ BINNING_DEFAULTS = {
     # 0 leaves the boundaries where find_slices() put them and only replaces the mass
     # axis, which is the cheaper half and the one that can be compared to greedy directly.
     "dp_max_iterations": 0,
+    # Processes the binning does not look at: the edges are chosen as if these did not
+    # exist, and they are then written into the shapes like any other. Not a weaker gate
+    # -- they are absent from the gates, from the summed background, from the figure of
+    # merit and from the bin budget alike.
+    #
+    # For a background whose MC statistics cannot support any split this is the difference
+    # between a binning and no binning. DY in the same-flavour channels holds eE and muMu
+    # at one mass bin in the signal-like slice however good the search is: at MX=800,
+    # eE/SR/res2b has 10.7 background events and a budget of 10 bins there, and *no*
+    # partition into more than one bin exists, because min_bin_bkg_each_neff requires DY
+    # to be measured in every bin and no split leaves it so.
+    #
+    # What this buys has to be checked against the fit, not assumed: a bin the binning
+    # declined to see DY in still has DY in it when combine reads the card, and
+    # autoMCStats will price its MC uncertainty there. Excluding a process from the choice
+    # of edges does not make its statistics better.
+    "binning_exclude_processes": [],
+    # Written into a negative bin of a *released* process, with an error of a tenth of it.
+    # null (the default) leaves negative bins exactly as they are, which is the previous
+    # behaviour and leaves them to resolveNegativeBins in the datacard maker.
+    #
+    # Scoped to the released processes rather than applied to everything, because that is
+    # the only place it is needed and it is not free elsewhere. Releasing a process is
+    # what makes negative bins expected rather than exceptional, and combine cannot fit a
+    # negative background. Applying it to every process instead measurably costs limit in
+    # channels that never needed it: at MX=800 filling everywhere moved eMu from 0.0310 to
+    # 0.0312 with a bit-identical binning, purely because bins that had been negative or
+    # empty now carry 0.01 of background each.
+    "fill_negative_bins": None,
 }
 
 # Named here so the yaml path can be checked against the same list the command line's
@@ -137,6 +166,18 @@ def load_binning_config(path, overrides=None):
         raise RuntimeError(
             f"{path or 'binning configuration'}: significance_mode "
             f"'{knobs['significance_mode']}' is not one of {sorted(SIGNIFICANCE_MODES)}."
+        )
+    fill = knobs["fill_negative_bins"]
+    if fill is not None and not (isinstance(fill, (int, float)) and fill > 0):
+        raise RuntimeError(
+            f"{path or 'binning configuration'}: fill_negative_bins must be a positive "
+            f"number or null, not {fill!r}. It is the yield a negative bin is written "
+            "with, and a zero or negative one would not fix what it exists to fix."
+        )
+    if not isinstance(knobs["binning_exclude_processes"], list):
+        raise RuntimeError(
+            f"{path or 'binning configuration'}: binning_exclude_processes must be "
+            f"a list of process names, not {knobs['binning_exclude_processes']!r}."
         )
     for key, allowed in (
         ("strategy", BINNING_STRATEGIES),
@@ -457,7 +498,16 @@ def _slice_dp_curve(cells, xlo, xhi, knobs, max_bins, check=True):
 
     score, valid = slice_tables(cells, xlo, xhi, exempt, knobs, mode)
     if check:
-        check_mask_against_gate(cells, xlo, xhi, valid, score, exempt, bin_passes, mode)
+        check_mask_against_gate(
+            cells,
+            xlo,
+            xhi,
+            valid,
+            score,
+            exempt,
+            bin_passes,
+            mode,
+        )
     values, partitions = partition_dp(score, valid, max_bins)
     # back from working indices to bin numbers
     ranges = [None if p is None else [(a + 1, b + 1) for a, b in p] for p in partitions]
@@ -569,7 +619,11 @@ def _x_step(cells, partitions, knobs, exempt_full):
     that will be written into them.
     """
     score, valid = slice_axis_tables(
-        cells, partitions, knobs, knobs["significance_mode"], exempt_full
+        cells,
+        partitions,
+        knobs,
+        knobs["significance_mode"],
+        exempt_full,
     )
     parts = partition_dp_staged(score, valid, len(partitions))
     if parts is None:
@@ -668,6 +722,22 @@ def discover_binning(sig2d, bkg2d_by_name, knobs):
 
     Returns None when the category cannot be binned, which the caller reports as a skip.
     """
+    excluded = set(knobs["binning_exclude_processes"])
+    if excluded:
+        # Dropped here, once, rather than special-cased in every gate and every score
+        # below. "Choose the edges as if this process were not there" is exactly the
+        # statement "do not put it in the dictionary the chooser reads", and expressing it
+        # that way means no downstream code has to know the feature exists -- including
+        # the greedy strategy, which then gets it for free and stays comparable.
+        kept = {n: h for n, h in bkg2d_by_name.items() if n not in excluded}
+        if not kept:
+            # Every background excluded: there is nothing left to place an edge against,
+            # and a binning derived from signal alone would be a fit to the signal MC.
+            raise RuntimeError(
+                "binning_exclude_processes excludes every background this category has "
+                f"({sorted(bkg2d_by_name)}), leaving nothing to bin against."
+            )
+        bkg2d_by_name = kept
     if knobs["strategy"] == "dp":
         return _discover_dp(sig2d, bkg2d_by_name, knobs)
     return _discover_greedy(sig2d, bkg2d_by_name, knobs)
@@ -794,9 +864,36 @@ def record_to_slices(record, x_axis, y_axis, where):
     ]
 
 
-def rebin_hist_2d(hist2d, slices, name, naming):
+def _is_released(key, released):
+    """Whether a histogram key belongs to one of the released processes.
+
+    Keys are "DY" for the nominal and "DY_<nuisance>_<Up|Down>" for a variation, so a
+    process owns its own name and anything under it with the separator. The separator is
+    required so that releasing "DY" cannot also claim a process called "DYJets".
+    """
+    return any(key == name or key.startswith(name + "_") for name in released)
+
+
+def rebin_hist_2d(hist2d, slices, name, naming, fill_negative=None):
     """Given the discovered slice structure, produce one final TH1 per slice
-    for this specific histogram (nominal or a systematic variation)."""
+    for this specific histogram (nominal or a systematic variation).
+
+    With fill_negative set, a bin whose content comes out negative is written as that
+    value with a tenth of it as the error, rather than as the negative it is. combine
+    cannot fit a negative background, and resolveNegativeBins rejects a negative bin
+    outright once it holds enough of the signal to count as relevant -- so for a process
+    released from the binning gates, which is where negative bins are expected rather than
+    exceptional, this is what keeps the datacard buildable.
+
+    Applied to every histogram of that process including its systematic variations,
+    because a negative variation is no more usable than a negative nominal. Which
+    processes get here at all is the caller's decision -- see _is_released().
+
+    What it costs is worth stating: a filled bin claims a background of fill +- fill/10,
+    i.e. known to 10%, when what was actually measured is a yield consistent with zero and
+    of unknown sign. That is an assertion of knowledge the MC does not support, and
+    autoMCStats will not widen it back out. It buys a fit that runs; it does not buy a
+    background estimate."""
     outputs = []
     for slice_idx, sl in enumerate(slices):
         xlo, xhi = sl["x_range"]
@@ -823,8 +920,12 @@ def rebin_hist_2d(hist2d, slices, name, naming):
         for bin_idx, (ylo, yhi) in enumerate(sl["y_ranges"], start=1):
             err = array.array("d", [0.0])
             content = hist2d.IntegralAndError(xlo, xhi, ylo, yhi, err)
+            error = err[0]
+            if fill_negative is not None and content < 0:
+                content = fill_negative
+                error = fill_negative / 10.0
             h.SetBinContent(bin_idx, content)
-            h.SetBinError(bin_idx, err[0])
+            h.SetBinError(bin_idx, error)
         outputs.append(h)
     return outputs
 
@@ -961,7 +1062,21 @@ def process_category(
             hist2d = get_hist(in_file, prefix + key)
             if hist2d is None or hist2d.GetDimension() != 2:
                 continue
-            for slice_idx, h in enumerate(rebin_hist_2d(hist2d, slices, key, naming)):
+            for slice_idx, h in enumerate(
+                rebin_hist_2d(
+                    hist2d,
+                    slices,
+                    key,
+                    naming,
+                    (
+                        knobs.get("fill_negative_bins")
+                        if _is_released(
+                            key, knobs.get("binning_exclude_processes") or []
+                        )
+                        else None
+                    ),
+                )
+            ):
                 out_file.cd(f"{channel}/{naming.name(category, slice_idx)}")
                 h.Write(key)
 
@@ -1251,6 +1366,22 @@ if __name__ == "__main__":
             help=help_text,
         )
     parser.add_argument(
+        "--fill-negative-bins",
+        required=False,
+        type=float,
+        default=None,
+        help="write any negative bin as this yield, with a tenth of it as the error; "
+        "omit to leave negative bins alone",
+    )
+    parser.add_argument(
+        "--binning-exclude-processes",
+        required=False,
+        type=str,
+        default=None,
+        help="comma-separated processes the binning ignores entirely, e.g. 'DY'; the "
+        "edges are chosen as if they did not exist and they are still written out",
+    )
+    parser.add_argument(
         "--strategy",
         required=False,
         type=str,
@@ -1283,6 +1414,12 @@ if __name__ == "__main__":
     overrides = {name: getattr(args, name) for name in knob_args}
     overrides["significance_mode"] = args.significance_mode
     overrides["strategy"] = args.strategy
+    overrides["fill_negative_bins"] = args.fill_negative_bins
+    overrides["binning_exclude_processes"] = (
+        args.binning_exclude_processes.split(",")
+        if args.binning_exclude_processes
+        else None
+    )
     overrides["dp_budget_mode"] = args.dp_budget_mode
     knobs = load_binning_config(args.binning_config, overrides)
 

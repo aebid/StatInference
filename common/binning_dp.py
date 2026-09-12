@@ -655,7 +655,16 @@ def slice_tables(cells, x0, x1, exempt, knobs, mode):
 
 
 def check_mask_against_gate(
-    cells, x0, x1, valid, score, exempt, bin_passes, mode, n_samples=150, seed=0
+    cells,
+    x0,
+    x1,
+    valid,
+    score,
+    exempt,
+    bin_passes,
+    mode,
+    n_samples=150,
+    seed=0,
 ):
     """Re-derive a sample of the vectorised tables with the canonical scalar gate.
 

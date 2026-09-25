@@ -23,7 +23,7 @@ import os
 
 import yaml
 
-from StatInference.common.tools import importROOT
+from StatInference.common.tools import importROOT, InputCategories
 from StatInference.common.param_parse import extractParameters
 from StatInference.dc_make.model import Model
 
@@ -105,6 +105,9 @@ def load_config(config_path):
         # it against the pattern the shapes are actually written with. None when the
         # configuration names no pattern, and then there is nothing to check.
         "category_pattern": cfg.get("category_pattern"),
+        # Where a base category is read from, when the input keys it per model point
+        # (see InputCategories). Written back out under the category's own name.
+        "input_categories": InputCategories.fromConfig(cfg),
         "signal_hist_name_patterns": signal_hist_names,
         "signal_param_name": extractParameters(signal_hist_names[0])[0],
         "mass_values": mass_values,

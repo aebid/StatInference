@@ -19,6 +19,12 @@ class MergedHists(StatInferenceTask, law.ExternalTask):
 
     variable = luigi.Parameter(description="Hists_merged variable (directory) name")
 
+    # The input file is the same whichever configuration reads it.
+    exclude_params_req = StatInferenceTask.exclude_params_req | {
+        "datacard_config",
+        "datacard_tag",
+    }
+
     def output(self):
         return self.remote_target(
             self.input_hists_version,

@@ -11,6 +11,7 @@ from .MergedHists import MergedHists
 from .PreprocessShapesTask import PreprocessShapesTask
 from .CreateDatacardsTask import CreateDatacardsTask
 from .ResonantLimitsTask import ResonantLimitsTask
+from .CombinedResonantLimitsTask import CombinedResonantLimitsTask
 from .PlotResonantLimitsTask import PlotResonantLimitsTask
 from .PlotPullsAndImpactsTask import PlotPullsAndImpactsTask
 from .ResonantLimitsAndHistPlotTask import ResonantLimitsAndHistPlotTask
@@ -21,6 +22,7 @@ __all__ = [
     "PreprocessShapesTask",
     "CreateDatacardsTask",
     "ResonantLimitsTask",
+    "CombinedResonantLimitsTask",
     "PlotResonantLimitsTask",
     "PlotPullsAndImpactsTask",
     "ResonantLimitsAndHistPlotTask",

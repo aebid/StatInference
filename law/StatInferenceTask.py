@@ -2,6 +2,7 @@ import contextlib
 import law
 import luigi
 import os
+import re
 import shutil
 import yaml
 
@@ -29,9 +30,35 @@ class StatInferenceTask(Task):
         description="version of the Hists_merged tree to read; defaults to --version",
     )
 
+    # The datacard configuration to run, when it is not global.yaml's StatInference.config.
+    # A combination configuration sets it on each of its members, which is how two
+    # configurations run side by side in one invocation. Significant: two configurations
+    # are two different sets of products.
+    datacard_config = luigi.Parameter(
+        default="",
+        description="datacard configuration to use instead of StatInference.config",
+    )
+    # Names this configuration's products under --version (<version>/<tag>/...), so the
+    # members of a combination do not overwrite each other. Empty keeps the products
+    # directly under --version, which is what every single-configuration run has always
+    # written -- and so what its completed outputs are found under.
+    datacard_tag = luigi.Parameter(
+        default="",
+        description="sub-directory of --version holding this configuration's products",
+    )
+
     @property
     def input_hists_version(self):
         return self.hists_version or self.version
+
+    def version_parts(self):
+        """The leading path components of every product: --version, then the tag.
+
+        A combination configuration's own products (its combined cards, limits and plots)
+        default to the tag "combined", beside its members' own sub-directories.
+        """
+        tag = self.datacard_tag or ("combined" if self.is_combination() else "")
+        return (self.version, tag) if tag else (self.version,)
 
     def output_dir_target(self, *path):
         """remote_dir_target() that also works when fs_default is a local directory.
@@ -50,9 +77,8 @@ class StatInferenceTask(Task):
         return self.remote_dir_target(*path)
 
     def datacard_config_path(self):
-        return os.path.join(
-            self.ana_path(), self.global_params["StatInference"]["config"]
-        )
+        path = self.datacard_config or self.global_params["StatInference"]["config"]
+        return path if os.path.isabs(path) else os.path.join(self.ana_path(), path)
 
     def get_config_data(self):
         # Cached per instance: requires()/workflow_requires() are re-entered many times
@@ -61,6 +87,58 @@ class StatInferenceTask(Task):
             with open(self.datacard_config_path(), "r") as f:
                 self._config_data = yaml.safe_load(f)
         return self._config_data
+
+    def is_combination(self):
+        """Whether the configuration combines others (`members:`) rather than building
+        datacards itself."""
+        return bool(self.get_config_data().get("members"))
+
+    def members(self):
+        """{name: spec} of a combination configuration, validated.
+
+        Each spec names the member's datacard configuration and, because the members are
+        usually built from different histogram productions, the Hists_merged version and
+        the user_custom overlay (which is where fs_HistTuple is set) to read them with.
+        """
+        members = self.get_config_data().get("members") or {}
+        known = {"config", "hists_version", "user_custom", "customisations"}
+        for name, spec in members.items():
+            if not isinstance(spec, dict) or "config" not in spec:
+                raise RuntimeError(
+                    f"{self.datacard_config_path()}: member '{name}' must be a mapping "
+                    "with at least 'config'"
+                )
+            unknown = sorted(set(spec) - known)
+            if unknown:
+                raise RuntimeError(
+                    f"{self.datacard_config_path()}: member '{name}' has unknown keys "
+                    f"{unknown}; known are {sorted(known)}"
+                )
+            if not re.fullmatch(r"[A-Za-z0-9_]+", str(name)) or name == "combined":
+                raise RuntimeError(
+                    f"{self.datacard_config_path()}: member name '{name}' must be "
+                    "alphanumeric and not 'combined' -- it names a directory and a "
+                    "combineCards label"
+                )
+        return members
+
+    def member_req(self, name, cls, **kwargs):
+        """`cls` for member `name`: its configuration, under its own tag, reading its own
+        histograms. Everything else (version, period, workflow, ...) is inherited.
+
+        FLAF builds a Setup per (user_custom, customisations), so a member with its own
+        user_custom reads from its own fs_HistTuple within the same invocation.
+        """
+        spec = self.members()[name]
+        params = dict(
+            datacard_config=spec["config"],
+            datacard_tag=name,
+            hists_version=spec.get("hists_version", self.hists_version),
+            user_custom=spec.get("user_custom", self.user_custom),
+            customisations=spec.get("customisations", self.customisations),
+        )
+        params.update(kwargs)
+        return cls.req(self, **params)
 
     @property
     def datacard_era(self):
@@ -85,7 +163,7 @@ class StatInferenceTask(Task):
 
         Identical to the old value for every task without a meta_era.
         """
-        return (self.version, self.__class__.__name__, self.datacard_era)
+        return (*self.version_parts(), self.__class__.__name__, self.datacard_era)
 
     def datacards_dir(self, era):
         """Local directory holding an era's datacards.
@@ -94,7 +172,9 @@ class StatInferenceTask(Task):
         combine sees them; ResonantLimitsTask mirrors them here and everything downstream
         (dhi's --multi-datacards globbing, the overlay plots) resolves against this path.
         """
-        return os.path.join(self.ana_data_path(), self.version, "Datacards", era)
+        return os.path.join(
+            self.ana_data_path(), *self.version_parts(), "Datacards", era
+        )
 
     def preprocess_config(self):
         """The datacard configuration's `preprocess:` block, or None.

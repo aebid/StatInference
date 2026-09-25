@@ -18,6 +18,7 @@ from dhi.tasks.resonant import (
 from .DhiPlotMixin import DhiPlotMixin
 from .StatInferenceTask import StatInferenceTask
 from .ResonantLimitsTask import ResonantLimitsTask
+from .CombinedResonantLimitsTask import CombinedResonantLimitsTask
 
 
 class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
@@ -46,12 +47,19 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
     def requires(self):
         # ResonantLimitsTask is what mirrors the cards to datacards_dir(), which is what
         # the globs below resolve against -- the plots cannot be built before it has run.
-        return [ResonantLimitsTask.req(self)]
+        if not self.is_combination():
+            return [ResonantLimitsTask.req(self)]
+        # A combination draws from its members' cards, so it needs their chains -- and it
+        # also draws each member's own limit_plots, under <version>/<member>/LimitPlots,
+        # so one invocation yields the per-member plots and the combined ones together.
+        return [CombinedResonantLimitsTask.req(self)] + [
+            self.member_req(name, PlotResonantLimitsTask) for name in self.members()
+        ]
 
     def output(self):
         # fs_default, like CreateDatacardsTask. Holds one
         # <era>/ sub-directory of plots plus plots.json naming them.
-        return self.output_dir_target(self.version, "LimitPlots")
+        return self.output_dir_target(*self.version_parts(), "LimitPlots")
 
     def _resolve_config_path(self, path):
         return path if os.path.isabs(path) else os.path.join(self.ana_path(), path)
@@ -160,18 +168,23 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
         same cards the leading curve is drawn from.
         """
         name = entry.get("name") or "limits"
-        base_dir = self.datacards_dir(era)
 
         sequences, names = [], []
         for card in entry["datacards"]:
-            pattern = os.path.join(
-                base_dir, Template(card["glob"]).safe_substitute(ERA=era)
-            )
-            if not glob.glob(pattern):
-                raise RuntimeError(
-                    f"limit_plots entry '{name}': no datacard matches '{pattern}'. "
-                    f"Check the glob against the cards under {base_dir}."
-                )
+            # A curve may draw on several globs: dhi groups every card they match by
+            # the mass in its name and combines each group, so globs over two members'
+            # cards give their combined limit.
+            globs = card["glob"] if isinstance(card["glob"], list) else [card["glob"]]
+            patterns = []
+            for g in globs:
+                base_dir, rel = self.glob_base(g, era, name)
+                pattern = os.path.join(base_dir, Template(rel).safe_substitute(ERA=era))
+                if not glob.glob(pattern):
+                    raise RuntimeError(
+                        f"limit_plots entry '{name}': no datacard matches '{pattern}'. "
+                        f"Check the glob against the cards under {base_dir}."
+                    )
+                patterns.append(pattern)
             label = card["name"]
             if "{" in label or "}" in label:
                 # law brace-expands datacard_names, so "fb^{-1}" would arrive as "fb^-1".
@@ -179,9 +192,27 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
                     f"limit_plots entry '{name}': datacard name '{label}' contains braces, "
                     "which law brace-expands. Put the information in the campaign label instead."
                 )
-            sequences.append((pattern,))
+            sequences.append(tuple(patterns))
             names.append(label)
         return sequences, names
+
+    def glob_base(self, card_glob, era, entry_name):
+        """(directory, relative glob) a limit_plots glob resolves against.
+
+        In a single configuration that is its own datacards directory for the era. In a
+        combination every glob names the member it reads, "SL:${ERA}/e/*.txt", and
+        resolves against that member's directory; a bare glob there would have no
+        datacards to match, so it is refused rather than left to match nothing.
+        """
+        if not self.is_combination():
+            return self.datacards_dir(era), card_glob
+        member, sep, rel = card_glob.partition(":")
+        if not sep or member not in self.members():
+            raise RuntimeError(
+                f"limit_plots entry '{entry_name}': glob '{card_glob}' must name a member "
+                f"as '<member>:<glob>'; members are {sorted(self.members())}"
+            )
+        return self.member_req(member, ResonantLimitsTask).datacards_dir(era), rel
 
     def limits_npz(self, sequence):
         """The MergeResonantLimits .npz for a datacard sequence, produced if absent.

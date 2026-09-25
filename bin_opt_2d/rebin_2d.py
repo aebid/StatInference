@@ -2,6 +2,7 @@ import math
 import array
 import json
 import os
+import re
 import sys
 
 import numpy as np
@@ -1241,6 +1242,27 @@ def rebin_hist_2d(hist2d, slices, name, naming, fill_negative=None, override=Non
     return outputs
 
 
+def other_point_signal(key, patterns, param_name, value):
+    """Whether `key` is a signal histogram -- nominal or a systematic variation -- of a
+    model point other than `value`.
+
+    The merged input for one mass carries every signal sample at every mass (the SL
+    files hold XtoHHto2B2W_1L/2L and XtoHHto2Tau2B at 300 ... 4000 GeV), but the file
+    written here is only ever read for its own mass: input_file_pattern names the mass,
+    so the datacard for any other one reads its signal from its own file. Keeping the
+    rest multiplies the output for nothing.
+    """
+    placeholder = "${" + param_name + "}"
+    for pattern in patterns:
+        head, found, tail = pattern.partition(placeholder)
+        if not found:
+            continue
+        match = re.match(re.escape(head) + r"(\d+)" + re.escape(tail) + r"(?:_|$)", key)
+        if match and match.group(1) != str(value):
+            return True
+    return False
+
+
 def process_category(
     sources,
     channel,
@@ -1411,6 +1433,10 @@ def process_category(
             print(f"  [skip] {source_era} {channel}/{category}: not in the input")
             continue
         for key in [k.GetName() for k in cat_dir.GetListOfKeys()]:
+            if other_point_signal(
+                key, cfg["signal_hist_name_patterns"], param_name, mass
+            ):
+                continue
             hist2d = get_hist(in_file, prefix + key)
             if hist2d is None or hist2d.GetDimension() != 2:
                 continue

@@ -1000,7 +1000,10 @@ def fitted_tail_full(x, values, variances, knobs):
     """
     out_v, out_var = values.copy(), variances.copy()
     res = fit_log_quadratic(
-        x, values, variances, knobs.get("fit_tail_fit_min_neff", 1.0),
+        x,
+        values,
+        variances,
+        knobs.get("fit_tail_fit_min_neff", 1.0),
         int(knobs.get("fit_tail_last_k", 12)),
     )
     if res is None:
@@ -1100,14 +1103,18 @@ def box_tables(cells, y0, y1, exempt, knobs, mode, override=None):
     b_tot = ranges(cells._bkg_tot)
     for name, (v, var) in override.items():
         # the total follows whatever this process was replaced by
-        b_tot = b_tot - ranges(cells._bkg[name]) + _ranges_from_column(
-            profile_column(v), nx, True
+        b_tot = (
+            b_tot
+            - ranges(cells._bkg[name])
+            + _ranges_from_column(profile_column(v), nx, True)
         )
     b_tot = np.where(np.abs(b_tot) < cells._eps_tot, 0.0, b_tot)
     v_tot = ranges(cells._var_tot)
     for name, (v, var) in override.items():
-        v_tot = v_tot - ranges(cells._var[name]) + _ranges_from_column(
-            profile_column(var), nx, True
+        v_tot = (
+            v_tot
+            - ranges(cells._var[name])
+            + _ranges_from_column(profile_column(var), nx, True)
         )
     err = np.sqrt(np.maximum(v_tot, 0.0))
 

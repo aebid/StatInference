@@ -17,6 +17,52 @@ from .CreateDatacardsTask import CreateDatacardsTask
 COMBINED_KEY = "__combined__"
 
 
+def cards_by_mass(cards):
+    """{mass: card} from datacard paths named "..._<mass>.txt"."""
+    out = {}
+    for c in cards:
+        m = re.search(r"_(\d+)\.txt$", c)
+        if m:
+            out[m.group(1)] = c
+    return out
+
+
+def combine_cards_per_mass(labelled_cards, staging, env):
+    """Write staging/combined_<mass>.txt for every mass, combining one card per label.
+
+    `labelled_cards` is [(label, [card, ...])]; the label prefixes the bins combineCards
+    writes (era names across eras, member names across a combination), so labels must be
+    unique. A mass a label has no card for is combined from the others.
+    """
+    by_label = [(label, cards_by_mass(cards)) for label, cards in labelled_cards]
+    masses = sorted({m for _, cards in by_label for m in cards}, key=int)
+    written = []
+    for mass in masses:
+        args = [f"{label}={cards[mass]}" for label, cards in by_label if mass in cards]
+        out_file = os.path.join(staging, f"combined_{mass}.txt")
+        with open(out_file, "w") as f:
+            subprocess.run(["combineCards.py"] + args, env=env, stdout=f, check=True)
+        written.append(out_file)
+    return written
+
+
+def publish_dir(staging, target):
+    """Replace directory `target` with the files in `staging`, returning their paths.
+
+    Replaced rather than written into, and only once everything is staged: a failure
+    halfway otherwise leaves a directory law takes for a complete output.
+    """
+    if target.exists():
+        target.remove()
+    target.touch()
+    published = []
+    for name in sorted(os.listdir(staging)):
+        dest = os.path.join(target.path, name)
+        shutil.copy2(os.path.join(staging, name), dest)
+        published.append(dest)
+    return published
+
+
 class ResonantLimitsTask(StatInferenceTask):
     # Not a workflow itself. The parameter exists so that --workflow reaches the tasks
     # below that are -- law's req() only forwards parameters both tasks declare -- and
@@ -24,7 +70,7 @@ class ResonantLimitsTask(StatInferenceTask):
     workflow = luigi.Parameter(default=law.parameter.NO_STR)
 
     def store_parts(self):
-        return (self.version, self.__class__.__name__, "combined")
+        return (*self.version_parts(), self.__class__.__name__, "combined")
 
     def get_eras(self):
         """Every era the configuration lists: each gets its own cards and its own limit."""
@@ -52,6 +98,19 @@ class ResonantLimitsTask(StatInferenceTask):
             "era_limits": law.LocalDirectoryTarget(self.local_path("era_limits")),
             "datacards": law.LocalDirectoryTarget(self.datacards_dir("combined")),
         }
+
+    def headline_cards(self):
+        """The per-mass cards this configuration's limit is set on, once run() has run:
+        the cross-era combined cards when several top-level eras are combined, else the
+        single top-level era's own. What a combination configuration combines."""
+        top_level = self.get_top_level_eras()
+        if len(top_level) > 1:
+            return sorted(
+                glob.glob(os.path.join(self.datacards_dir("combined"), "*.txt"))
+            )
+        return sorted(
+            glob.glob(os.path.join(self.datacards_dir(top_level[0]), "*.txt"))
+        )
 
     def stage_datacards(self, era, remote_target):
         """Mirror an era's datacards from fs_default to a stable local path, returned.
@@ -85,13 +144,6 @@ class ResonantLimitsTask(StatInferenceTask):
             output_dir = self.stage_datacards(e, create_dc_br0.output())
             era_cards[e] = glob.glob(os.path.join(output_dir, "*.txt"))
 
-        masses = set()
-        for e, cards in era_cards.items():
-            for c in cards:
-                m = re.search(r"_(\d+)\.txt$", c)
-                if m:
-                    masses.add(m.group(1))
-
         # Built into a staging directory and published only once every card is there.
         # Creating the outputs first and filling them as we go left a failed
         # combineCards halfway through looking like a complete task -- law's default
@@ -102,29 +154,12 @@ class ResonantLimitsTask(StatInferenceTask):
             # The cross-era combination is the one place a group era and its members
             # cannot both appear: the group already *is* their combination, so a card
             # built from both would count those events twice.
-            for mass in sorted(masses):
-                combine_args = []
-                for e in self.get_top_level_eras():
-                    for c in era_cards.get(e, []):
-                        if c.endswith(f"_{mass}.txt"):
-                            combine_args.append(f"{e}={c}")
-                            break
-
-                if combine_args:
-                    cmd = ["combineCards.py"] + combine_args
-                    out_file = os.path.join(staging, f"combined_{mass}.txt")
-                    with open(out_file, "w") as f:
-                        subprocess.run(cmd, env=self.cmssw_env, stdout=f, check=True)
-
-            out_dc_dir = self.output()["datacards"]
-            if out_dc_dir.exists():
-                out_dc_dir.remove()
-            out_dc_dir.touch()
-            combined_cards = []
-            for name in sorted(os.listdir(staging)):
-                dest = os.path.join(out_dc_dir.path, name)
-                shutil.copy2(os.path.join(staging, name), dest)
-                combined_cards.append(dest)
+            combine_cards_per_mass(
+                [(e, era_cards.get(e, [])) for e in self.get_top_level_eras()],
+                staging,
+                self.cmssw_env,
+            )
+            combined_cards = publish_dir(staging, self.output()["datacards"])
 
         # One merge per era, never one merge over every era's cards together. dhi groups
         # the datacards it is given by the mass in their file name alone and runs

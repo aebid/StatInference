@@ -81,7 +81,9 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
         # fs_default. Note that combine cannot read these directly:
         # ResonantLimitsTask mirrors them back to datacards_dir() before handing them to
         # dhi -- see ResonantLimitsTask.stage_datacards.
-        return self.output_dir_target(self.version, "Datacards", self.datacard_era)
+        return self.output_dir_target(
+            *self.version_parts(), "Datacards", self.datacard_era
+        )
 
     def run(self):
         statInf_entry = self.global_params["StatInference"]

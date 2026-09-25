@@ -63,7 +63,7 @@ class PreprocessShapesTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflo
 
     def output(self):
         return self.output_dir_target(
-            self.version, "Hists_preprocessed", self.datacard_era
+            *self.version_parts(), "Hists_preprocessed", self.datacard_era
         )
 
     def run(self):

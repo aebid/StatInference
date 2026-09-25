@@ -272,7 +272,11 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
             )
 
         columns = sorted(
-            {(region, cat) for _, _, present in per_variable for _, region, cat in present},
+            {
+                (region, cat)
+                for _, _, present in per_variable
+                for _, region, cat in present
+            },
             key=column_key,
         )
         if not columns:

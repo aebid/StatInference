@@ -105,8 +105,12 @@ class ResonantLimitsTask(StatInferenceTask):
         single top-level era's own. What a combination configuration combines."""
         top_level = self.get_top_level_eras()
         if len(top_level) > 1:
-            return sorted(glob.glob(os.path.join(self.datacards_dir("combined"), "*.txt")))
-        return sorted(glob.glob(os.path.join(self.datacards_dir(top_level[0]), "*.txt")))
+            return sorted(
+                glob.glob(os.path.join(self.datacards_dir("combined"), "*.txt"))
+            )
+        return sorted(
+            glob.glob(os.path.join(self.datacards_dir(top_level[0]), "*.txt"))
+        )
 
     def stage_datacards(self, era, remote_target):
         """Mirror an era's datacards from fs_default to a stable local path, returned.

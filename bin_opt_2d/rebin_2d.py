@@ -227,7 +227,9 @@ def load_binning_config(path, overrides=None):
             f"{path or 'binning configuration'}: min_bin_bkg_neff_by_process must map "
             f"process names to non-negative numbers, not {by_proc!r}."
         )
-    if (by_proc or knobs["min_bin_bkg_each"] is None) and knobs["strategy"] != "hme_box":
+    if (by_proc or knobs["min_bin_bkg_each"] is None) and knobs[
+        "strategy"
+    ] != "hme_box":
         raise RuntimeError(
             f"{path or 'binning configuration'}: min_bin_bkg_neff_by_process and "
             "min_bin_bkg_each: null are implemented for strategy hme_box only; the "
@@ -842,7 +844,14 @@ def _box_value(cells, y0, y1, knobs, check=False):
             )
 
         check_box_mask(
-            cells, y0, y1, valid, score, exempt, bin_passes, mode,
+            cells,
+            y0,
+            y1,
+            valid,
+            score,
+            exempt,
+            bin_passes,
+            mode,
             min_frac=knobs["min_bkg_frac"],
         )
     values, partitions = partition_dp(score, valid, knobs["max_bins_per_slice"])
@@ -1146,9 +1155,7 @@ def fitted_bins(cells, slices, knobs, name):
             continue
         # the fitted fine bins share the fit's three parameters, so their contributions
         # to this bin's integral are propagated together rather than in quadrature
-        error = fitted_integral_error(
-            cells.x_centres, info["p"], info["cov"], from_fit
-        )
+        error = fitted_integral_error(cells.x_centres, info["p"], info["cov"], from_fit)
         out.append((float(sum(fitted[i] for i in from_fit)), error, min(from_fit)))
     return out
 

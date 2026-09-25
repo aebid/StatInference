@@ -107,9 +107,14 @@ class Cells:
     because the binning is derived from the combination it will be applied to.
     """
 
-    def __init__(self, nx, ny, sig, bkg, var):
+    def __init__(self, nx, ny, sig, bkg, var, x_centres=None):
         self.nx = nx
         self.ny = ny
+        # bin centres of the x axis including under/overflow, for a profile fit; the
+        # outer two are placeholders one bin width outside, never fitted.
+        self.x_centres = (
+            x_centres if x_centres is not None else np.arange(nx + 2, dtype=np.float64)
+        )
         self.names = list(bkg)
         self._sig = _prefix(sig)
         self._bkg = {name: _prefix(bkg[name]) for name in self.names}
@@ -128,6 +133,16 @@ class Cells:
         self._eps_tot = _cancellation_eps(bkg_tot)
         self._eps_var = {name: _cancellation_eps(var[name]) for name in self.names}
         self._eps_var_tot = _cancellation_eps(var_tot)
+
+    def profile(self, name, y0, y1):
+        """(values, variances) per x bin for one process inside the y window [y0, y1].
+
+        Length nx+2, under- and overflow included, which is the array a fit and
+        _ranges_from_column() both expect.
+        """
+        col = self._bkg[name][:, y1 + 1] - self._bkg[name][:, y0]
+        var = self._var[name][:, y1 + 1] - self._var[name][:, y0]
+        return np.diff(col), np.diff(var)
 
     # -- the whole y axis, under- and overflow included: what a slice-level query means
     def full_y(self):
@@ -211,7 +226,14 @@ def build_cells(sig2d, bkg2d_by_name):
             variances += e2
         bkg[name] = values
         var[name] = variances
-    return Cells(nx, ny, sig, bkg, var)
+    axis = sig2d.GetXaxis()
+    width = axis.GetBinWidth(1)
+    centres = np.array(
+        [axis.GetBinLowEdge(1) - width]
+        + [axis.GetBinCenter(i) for i in range(1, nx + 1)]
+        + [axis.GetBinUpEdge(nx) + width]
+    )
+    return Cells(nx, ny, sig, bkg, var, centres)
 
 
 def parity_check(cells, sig2d, bkg2d_by_name, n_samples=200, seed=0):
@@ -534,10 +556,16 @@ def binning_objective(cells, slices, mode):
     """
     per_slice = []
     for sl in slices:
-        xlo, xhi = sl["x_range"]
-        per_slice.append(
-            sum(cells.score(xlo, xhi, ylo, yhi, mode) for ylo, yhi in sl["y_ranges"])
-        )
+        if "y_range" in sl:  # HME box: selection on y, bins along x
+            ylo, yhi = sl["y_range"]
+            per_slice.append(
+                sum(cells.score(a, b, ylo, yhi, mode) for a, b in sl["x_ranges"])
+            )
+        else:  # DNN slice: selection on x, bins along y
+            xlo, xhi = sl["x_range"]
+            per_slice.append(
+                sum(cells.score(xlo, xhi, a, b, mode) for a, b in sl["y_ranges"])
+            )
     return sum(per_slice), per_slice
 
 
@@ -898,3 +926,269 @@ def partition_dp_staged(score, valid, n_parts):
         parts.append((s, e - 1))
         e = s
     return list(reversed(parts))
+
+
+def fit_log_quadratic(x, values, variances, min_neff=1.0, last_k=12, monotone=True):
+    """Weighted fit of log y = a + b x + c x^2 to the falling side of a profile.
+
+    Returns (params, covariance, indices used) or None. The weights are the bins' own
+    effective entries, so neither the well-populated bulk nor the near-empty tail can
+    dominate; a linear-space least squares over a distribution spanning four decades is
+    dominated by the tail bins, whose absolute errors are tiny, and under-predicts by 40%.
+
+    The turn-over is found on a smoothed profile because these distributions are flat
+    through the bulk and fall above it -- fitted across both, the quadratic comes out
+    rising. With `monotone` the curve is constrained to fall over the whole range it will
+    be used on (c <= 0 and b + 2 c x_start <= 0); unconstrained, ~10% of boxes produced a
+    tail that turns back up, which is the quadratic fitting noise at the sparse end.
+    """
+    errors = np.sqrt(np.maximum(variances, 0.0))
+    neff = _neff_matrix(values, errors)
+    smooth = np.convolve(np.where(neff >= 1, values, 0.0), np.ones(5) / 5.0, "same")
+    # errors > 0 as well as the effective-entry cut: _neff_matrix reports infinite
+    # effective entries for a bin with content and no error (a sample with a single
+    # unweighted event there), and such a bin would carry infinite weight below.
+    good = np.where((neff >= min_neff) & (values > 0) & (errors > 0))[0]
+    good = good[good > int(np.argmax(smooth))]
+    if len(good) < 4:
+        return None
+    used = good[-last_k:]
+    X = np.vstack([x[used] ** k for k in range(3)]).T
+    w = (values[used] / errors[used]) ** 2
+    if not np.all(np.isfinite(w)):
+        return None
+    try:
+        cov = np.linalg.pinv(X.T @ (w[:, None] * X))
+    except np.linalg.LinAlgError:
+        # a degenerate window: no fit rather than a fit nobody can trust
+        return None
+    p = cov @ (X.T @ (w * np.log(values[used])))
+    if not np.all(np.isfinite(p)) or not np.all(np.isfinite(cov)):
+        return None
+    if monotone and (p[2] > 0 or p[1] + 2 * p[2] * x[used].min() > 0):
+        from scipy.optimize import minimize
+
+        logy = np.log(values[used])
+        x0 = float(x[used].min())
+        res = minimize(
+            lambda q: float(np.sum(w * (logy - X @ q) ** 2)),
+            p,
+            method="SLSQP",
+            constraints=[
+                {"type": "ineq", "fun": lambda q: -q[2]},
+                {"type": "ineq", "fun": lambda q: -(q[1] + 2 * q[2] * x0)},
+            ],
+            options={"maxiter": 500, "ftol": 1e-10},
+        )
+        if res.success:
+            p = res.x
+    return p, cov, used
+
+
+def fitted_tail_full(x, values, variances, knobs):
+    """A profile with its unreliable tail replaced by the fit of its own measured part.
+
+    Hybrid on purpose: bins the MC measures are kept as measured, and only the bins past
+    the last one with `fit_tail_min_neff` effective entries are taken from the fit, and
+    only where the fit is better determined than the count it replaces. The fit carries
+    the normalisation of the measured bins it was constrained by, so nothing is rescaled.
+
+    Returns (values, variances, n_replaced, info), where info carries the fit parameters,
+    their covariance and which bins were replaced -- needed to propagate the uncertainty
+    of an *integral* over several fitted bins, whose errors are not independent. The
+    inputs are returned unchanged when the fit cannot be constrained.
+    """
+    out_v, out_var = values.copy(), variances.copy()
+    res = fit_log_quadratic(
+        x, values, variances, knobs.get("fit_tail_fit_min_neff", 1.0),
+        int(knobs.get("fit_tail_last_k", 12)),
+    )
+    if res is None:
+        return out_v, out_var, 0, None
+    p, cov, used = res
+    errors = np.sqrt(np.maximum(variances, 0.0))
+    neff = _neff_matrix(values, errors)
+    threshold = knobs["fit_tail_min_neff"]
+    measured = np.where(neff >= threshold)[0]
+    last_measured = measured.max() if len(measured) else -1
+    n = 0
+    replaced = []
+    started = False
+    for i in range(int(last_measured) + 1, len(x)):
+        X = np.array([x[i] ** k for k in range(3)])
+        mu = float(np.exp(X @ p))
+        sigma = mu * math.sqrt(max(float(X @ cov @ X), 0.0))
+        if not started:
+            # where the tail starts: the first bin past the measured region where the fit
+            # is better determined than the count and is itself pinned down. Once it
+            # starts, it runs to the end of the axis -- the tail is one object, and
+            # leaving counted bins interspersed inside it would mean a template that is
+            # part fit and part noise over the same falling edge.
+            if sigma >= errors[i] > 0 or (mu > 0 and sigma / mu > 1.0):
+                continue
+            started = True
+        out_v[i], out_var[i] = mu, sigma**2
+        replaced.append(i)
+        n += 1
+    return out_v, out_var, n, {"p": p, "cov": cov, "replaced": replaced}
+
+
+def fitted_tail(x, values, variances, knobs):
+    """fitted_tail_full() without the fit record, for callers that only need the profile."""
+    v, var, n, _ = fitted_tail_full(x, values, variances, knobs)
+    return v, var, n
+
+
+def fitted_integral_error(x, p, cov, indices):
+    """Uncertainty of the summed fitted yield over `indices`, correlations included.
+
+    The bins of one box share three fitted parameters, so their uncertainties are nearly
+    fully correlated: summing their variances in quadrature understates the error on an
+    integral over them by a median factor 1.4 on these shapes, and by up to 2.2. The
+    integral's gradient is sum_i mu_i * X_i, and its variance g^T C g.
+    """
+    if not len(indices):
+        return 0.0
+    g = np.zeros(len(p))
+    for i in indices:
+        X = np.array([x[i] ** k for k in range(len(p))])
+        g = g + math.exp(float(X @ p)) * X
+    return math.sqrt(max(float(g @ cov @ g), 0.0))
+
+
+def profile_column(values):
+    """The prefix-sum column _ranges_from_column() expects, from a per-bin profile."""
+    return np.concatenate([[0.0], np.cumsum(values)])
+
+
+def box_tables(cells, y0, y1, exempt, knobs, mode, override=None):
+    """(score, valid) over every candidate bin of the *sliced-on-y* layout.
+
+    slice_tables() with the axes exchanged: there the window is on x and the bins run
+    along y, here the window is a cut on y -- an HME box around the resonance -- and the
+    bins run along x, the DNN. Same gates, same figure of merit; only which axis is the
+    selection and which carries the shape has changed.
+
+    The bins tile the whole x axis including its under/overflow, because everything inside
+    the box is kept and binned. The box itself is a selection: what falls outside it is
+    discarded, not swept into an outer bin, which is the difference between a cut and a
+    slice.
+
+    `exempt` is the set of processes excused from the per-bin floors over the whole box,
+    or None to judge that per candidate bin: a process is then excused in exactly the
+    bins where it is under min_bkg_frac of that bin's own background. Positivity is never
+    excused either way -- see _bin_passes.
+    """
+    nx = cells.nx
+    ranges = lambda prefix: _axis_ranges(prefix, y0, y1, nx, "x", True)
+    override = override or {}
+
+    def proc(name):
+        """This process's range table inside the window, fitted profile or counted."""
+        if name in override:
+            v, _ = override[name]
+            return _ranges_from_column(profile_column(v), nx, True)
+        return ranges(cells._bkg[name])
+
+    def proc_var(name):
+        if name in override:
+            _, var = override[name]
+            return _ranges_from_column(profile_column(var), nx, True)
+        return ranges(cells._var[name])
+
+    sig = ranges(cells._sig)
+    b_tot = ranges(cells._bkg_tot)
+    for name, (v, var) in override.items():
+        # the total follows whatever this process was replaced by
+        b_tot = b_tot - ranges(cells._bkg[name]) + _ranges_from_column(
+            profile_column(v), nx, True
+        )
+    b_tot = np.where(np.abs(b_tot) < cells._eps_tot, 0.0, b_tot)
+    v_tot = ranges(cells._var_tot)
+    for name, (v, var) in override.items():
+        v_tot = v_tot - ranges(cells._var[name]) + _ranges_from_column(
+            profile_column(var), nx, True
+        )
+    err = np.sqrt(np.maximum(v_tot, 0.0))
+
+    valid = np.triu(np.ones((nx, nx), dtype=bool))
+    if knobs["min_bin_bkg_neff"] > 0:
+        valid &= _neff_matrix(b_tot, err) >= knobs["min_bin_bkg_neff"]
+    per_bin = exempt is None
+    min_frac = knobs["min_bkg_frac"]
+    for name in cells.names:
+        b_p = proc(name)
+        b_p = np.where(np.abs(b_p) < cells._eps_bkg[name], 0.0, b_p)
+        valid &= b_p >= 0
+        if not per_bin and name in exempt:
+            continue
+        # None: no magnitude floor, only the non-negativity already applied above
+        min_each = knobs["min_bin_bkg_each"]
+        magnitude = (
+            b_p > min_each if min_each is not None else np.ones_like(valid, dtype=bool)
+        )
+        required = knobs.get("min_bin_bkg_neff_by_process", {}).get(
+            name, knobs["min_bin_bkg_each_neff"]
+        )
+        if required > 0:
+            v_p = proc_var(name)
+            magnitude &= _neff_matrix(b_p, np.sqrt(np.maximum(v_p, 0.0))) >= required
+        if per_bin and min_frac > 0:
+            # the same test Cells.exempt() makes, asked of each candidate bin
+            with np.errstate(invalid="ignore"):
+                magnitude |= (b_tot > 0) & (b_p < min_frac * b_tot)
+        valid &= magnitude
+    score = (
+        _asimov_z2_matrix(sig, b_tot, err)
+        if mode == "asimov"
+        else _sb_z2_matrix(sig, b_tot, err)
+    )
+    return np.where(valid, score, 0.0), valid
+
+
+def check_box_mask(
+    cells,
+    y0,
+    y1,
+    valid,
+    score,
+    exempt,
+    bin_passes,
+    mode,
+    n_samples=100,
+    seed=0,
+    min_frac=0.0,
+):
+    """The cross-check of box_tables() against the canonical scalar gate.
+
+    Same contract as check_mask_against_gate(): the fast path is re-derived on a random
+    sample with _bin_passes and significance() on every build, so the two spellings of the
+    rule cannot drift unnoticed.
+    """
+    nx = cells.nx
+    rng = np.random.default_rng(seed)
+    for _ in range(n_samples):
+        a = int(rng.integers(1, nx + 1))
+        b = int(rng.integers(a, nx + 1))
+        # the outermost bins carry the x under/overflow, because box_tables builds them
+        # with include_outer -- the reference has to ask the same question
+        lo = 0 if a == 1 else a
+        hi = nx + 1 if b == nx else b
+        exempt_here = (
+            cells.exempt(lo, hi, y0, y1, min_frac) if exempt is None else exempt
+        )
+        want = bool(bin_passes(lo, hi, y0, y1, exempt_here))
+        got = bool(valid[a - 1, b - 1])
+        if got != want:
+            raise AssertionError(
+                f"binning_dp box gate disagrees with _bin_passes on DNN bins {a}..{b} of "
+                f"the HME box {y0}..{y1}: fast path says {'valid' if got else 'invalid'}, "
+                f"_bin_passes says {'valid' if want else 'invalid'}."
+            )
+        if want:
+            expected = cells.score(lo, hi, y0, y1, mode)
+            if abs(expected - score[a - 1, b - 1]) > 1e-9 * max(abs(expected), 1.0):
+                raise AssertionError(
+                    f"binning_dp box score disagrees with significance() on DNN bins "
+                    f"{a}..{b} of box {y0}..{y1}: {score[a - 1, b - 1]!r} vs {expected!r}."
+                )

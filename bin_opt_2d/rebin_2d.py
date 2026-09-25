@@ -44,10 +44,15 @@ from StatInference.common.binning_core import (
     sum_hists,
 )
 from StatInference.common.binning_dp import (
+    fitted_integral_error,
+    fitted_tail,
+    fitted_tail_full,
     allocate_budget,
     binning_objective,
     build_cells,
     check_mask_against_gate,
+    box_tables,
+    check_box_mask,
     partition_dp,
     partition_dp_staged,
     slice_axis_tables,
@@ -128,14 +133,54 @@ BINNING_DEFAULTS = {
     # 0.0312 with a bit-identical binning, purely because bins that had been negative or
     # empty now carry 0.01 of background each.
     "fill_negative_bins": None,
+    # hme_box only: the search grid for the box edges. A full scan is ny(ny+1)/2 windows
+    # and every one of them carries its own dynamic program over the binned axis, so the
+    # edges are scanned on a stride and then refined within +-box_refine of the winner.
+    "box_stride": 6,
+    "box_refine": 5,
+    # hme_box only: the box is searched only where the signal is. A window that starts
+    # beyond the resonance adds background and no signal; scanning it is wasted time, and
+    # including it in the grid costs resolution where the answer actually lies.
+    "box_signal_quantile": 0.001,
+    # hme_box only: where min_bkg_frac is judged. "box" asks it once, over the whole HME
+    # window, and a process under that fraction of the box is then excused from the
+    # per-bin floors in *every* bin. That lets the choice of window switch a gate off: a
+    # box that happens to hold DY at 4.8% of its background frees DY from
+    # min_bin_bkg_each_neff everywhere inside it, including in the bins where DY is a
+    # fifth of the total (measured: muMu boosted MX=400, DY N_eff 0.17 over the box).
+    # "bin" asks it of each candidate DNN bin on its own, so a process is excused only
+    # where it really is negligible. Default "box" keeps earlier binnings reproducible.
+    "exempt_scope": "box",
+    # Per-process effective-entries requirement for every fit bin, in place of
+    # min_bin_bkg_each_neff for the processes it names, e.g. {TT: 25} asks TT to be known
+    # to 20% (1/0.2^2). Unnamed processes keep min_bin_bkg_each_neff. Subject to
+    # min_bkg_frac exemption like any other per-process gate. hme_box only for now: the
+    # DNN-slice strategies' vectorised tables do not read it.
+    "min_bin_bkg_neff_by_process": {},
+    # hme_box only: processes whose unreliable DNN tail is taken from a fit of their own
+    # measured part rather than counted. For DY the tail is one sample's cancelling
+    # weights -- errors larger than the yields -- and counting it both inflates the bins'
+    # uncertainty and drives the binning, since the gates see that error. The fit is per
+    # box because the DNN shape depends on the HME window.
+    "fit_tail_processes": [],
+    # base categories it applies in. Boosted is deliberately not one for bbWW: its DY has
+    # a median effective count of 1.8 over the whole box, so a fitted tail there would be
+    # an extrapolation with nothing behind it.
+    "fit_tail_categories": [],
+    # a bin is replaced once the profile has passed its last bin with this many effective
+    # entries -- and then only where the fit is better determined than the count.
+    "fit_tail_min_neff": 10.0,
+    # how many measured bins the fit is constrained by, counting back from the highest
+    "fit_tail_last_k": 12,
 }
 
 # Named here so the yaml path can be checked against the same list the command line's
 # choices= uses -- significance_mode already learned this lesson: it is read by a
 # function that silently treats anything unrecognised as a default, so a typo in the
 # yaml quietly changed the answer instead of failing.
-BINNING_STRATEGIES = ("greedy", "dp")
+BINNING_STRATEGIES = ("greedy", "dp", "hme_box")
 BUDGET_MODES = ("per_slice", "shared")
+EXEMPT_SCOPES = ("box", "bin")
 
 
 def load_binning_config(path, overrides=None):
@@ -174,6 +219,31 @@ def load_binning_config(path, overrides=None):
             f"number or null, not {fill!r}. It is the yield a negative bin is written "
             "with, and a zero or negative one would not fix what it exists to fix."
         )
+    by_proc = knobs["min_bin_bkg_neff_by_process"]
+    if not isinstance(by_proc, dict) or not all(
+        isinstance(v, (int, float)) and v >= 0 for v in by_proc.values()
+    ):
+        raise RuntimeError(
+            f"{path or 'binning configuration'}: min_bin_bkg_neff_by_process must map "
+            f"process names to non-negative numbers, not {by_proc!r}."
+        )
+    if (by_proc or knobs["min_bin_bkg_each"] is None) and knobs["strategy"] != "hme_box":
+        raise RuntimeError(
+            f"{path or 'binning configuration'}: min_bin_bkg_neff_by_process and "
+            "min_bin_bkg_each: null are implemented for strategy hme_box only; the "
+            f"'{knobs['strategy']}' strategy would silently ignore them."
+        )
+    for key in ("fit_tail_processes", "fit_tail_categories"):
+        if not isinstance(knobs[key], list):
+            raise RuntimeError(
+                f"{path or 'binning configuration'}: {key} must be a list, "
+                f"not {knobs[key]!r}."
+            )
+    if knobs["fit_tail_processes"] and knobs["strategy"] != "hme_box":
+        raise RuntimeError(
+            f"{path or 'binning configuration'}: fit_tail_processes is implemented for "
+            f"strategy hme_box only, not '{knobs['strategy']}'."
+        )
     if not isinstance(knobs["binning_exclude_processes"], list):
         raise RuntimeError(
             f"{path or 'binning configuration'}: binning_exclude_processes must be "
@@ -182,6 +252,7 @@ def load_binning_config(path, overrides=None):
     for key, allowed in (
         ("strategy", BINNING_STRATEGIES),
         ("dp_budget_mode", BUDGET_MODES),
+        ("exempt_scope", EXEMPT_SCOPES),
     ):
         if knobs[key] not in allowed:
             raise RuntimeError(
@@ -199,6 +270,7 @@ def _bin_passes(
     min_neff=0.0,
     errors=None,
     min_proc_neff=0.0,
+    proc_neff=None,
 ):
     """Mass-bin validity: every *relevant* background must exceed min_each, and
     (when min_neff > 0) the summed background must be known to at least min_neff
@@ -217,6 +289,10 @@ def _bin_passes(
     effective background count came out at ~2.8 against a slice threshold of 4.
     Note it constrains only the *summed* background, so it is satisfied by any one
     well-measured process; min_each/exempt is what protects the individual ones.
+
+    min_each None drops the magnitude floor entirely, leaving only non-negativity (0 is
+    not the same thing: it still demands a strictly positive yield). proc_neff maps a
+    process to its own effective-entries requirement, in place of min_proc_neff.
     """
     total = sum(yields.values())
     if min_neff > 0 and total_error is not None:
@@ -236,15 +312,16 @@ def _bin_passes(
             return False
         if name in exempt:
             continue
-        if value <= min_each:
+        if min_each is not None and value <= min_each:
             return False
         # Every background must be measured, not merely present: a yield known only
         # to a few hundred percent is not a background estimate. _slice_passes has
         # carried this arm for the sliced axis; the mass axis, where essentially all
         # fit bins live, had no per-process test at all -- only the summed one, which
         # any single well-measured process satisfies on its own.
-        if min_proc_neff > 0 and errors is not None:
-            if effective_entries(value, errors.get(name, 0.0)) < min_proc_neff:
+        required = (proc_neff or {}).get(name, min_proc_neff)
+        if required > 0 and errors is not None:
+            if effective_entries(value, errors.get(name, 0.0)) < required:
                 return False
     return True
 
@@ -712,6 +789,126 @@ def _discover_dp(sig2d, bkg2d_by_name, knobs):
     ]
 
 
+def _fit_override(cells, y0, y1, knobs):
+    """{process: (values, variances)} for this window, or {} when nothing is fitted.
+
+    Built per candidate window: the window is the selection the fit describes, so it has
+    to be re-derived as the box moves. Cheap -- one profile and a 3x3 solve.
+    """
+    names = [n for n in knobs["fit_tail_processes"] if n in cells.names]
+    if not names or not knobs.get("_fit_tail_active"):
+        return {}
+    x = cells.x_centres
+    out = {}
+    for name in names:
+        values, variances = cells.profile(name, y0, y1)
+        v, var, n = fitted_tail(x, values, variances, knobs)
+        if n:
+            out[name] = (v, var)
+    return out
+
+
+def _box_value(cells, y0, y1, knobs, check=False):
+    """What one HME box is worth: the best 1D binning of the DNN inside it.
+
+    A box is scored by the binning it admits, not by its own integrated significance.
+    Those are different questions and they pick different windows -- scored on its own, a
+    box is rewarded for swallowing as much signal as it can and the DNN shape inside it
+    plays no part, which is the opposite of what the fit will do with it.
+    """
+    mode = knobs["significance_mode"]
+    # None asks box_tables() and the cross-check to judge exemption bin by bin.
+    exempt = (
+        None
+        if knobs["exempt_scope"] == "bin"
+        else cells.exempt(1, cells.nx, y0, y1, knobs["min_bkg_frac"])
+    )
+    override = _fit_override(cells, y0, y1, knobs)
+    score, valid = box_tables(cells, y0, y1, exempt, knobs, mode, override)
+    if check and not override:
+        # the canonical scalar gate reads the histograms, so it cannot be asked about a
+        # fitted profile; the cross-check still runs on every unfitted box.
+
+        def bin_passes(a, b, ylo, yhi, exempt_set):
+            return _bin_passes(
+                cells.yields(a, b, ylo, yhi),
+                knobs["min_bin_bkg_each"],
+                exempt_set,
+                cells.total_bkg_error(a, b, ylo, yhi),
+                knobs["min_bin_bkg_neff"],
+                cells.errors(a, b, ylo, yhi),
+                knobs["min_bin_bkg_each_neff"],
+                knobs["min_bin_bkg_neff_by_process"],
+            )
+
+        check_box_mask(
+            cells, y0, y1, valid, score, exempt, bin_passes, mode,
+            min_frac=knobs["min_bkg_frac"],
+        )
+    values, partitions = partition_dp(score, valid, knobs["max_bins_per_slice"])
+    n = _best_count(values, knobs["max_bins_per_slice"])
+    if n is None:
+        return float("-inf"), None
+    if knobs["dp_min_bin_gain"] > 0 and values[n] > 0:
+        n = trim_by_marginal_gain([values], [n], knobs["dp_min_bin_gain"] * values[n])[
+            0
+        ]
+    return values[n], [(a + 1, b + 1) for a, b in partitions[n]]
+
+
+def _discover_hme_box(sig2d, bkg2d_by_name, knobs):
+    """One HME window per category, with the DNN binned inside it.
+
+    The other strategies cut the DNN into slices that each become a datacard category and
+    give every slice a shape along HME. This one does the reverse and keeps only one
+    category: a single contiguous HME box around the resonance, and a 1D DNN distribution
+    inside it. Everything outside the box is dropped -- that is what makes it a cut rather
+    than a slice, and it is why the box has to earn its acceptance loss in purity.
+
+    Box and binning are chosen together; see _box_value.
+    """
+    cells = build_cells(sig2d, bkg2d_by_name)
+    ny = cells.ny
+    # where the signal actually is -- see box_signal_quantile
+    cumulative = np.array(
+        [cells.signal(0, cells.nx + 1, 1, j) for j in range(1, ny + 1)]
+    )
+    total = cumulative[-1] if len(cumulative) else 0.0
+    if total <= 0:
+        return None
+    q = knobs["box_signal_quantile"]
+    lo_edge = max(1, int(np.searchsorted(cumulative, q * total)))
+    hi_edge = min(ny, int(np.searchsorted(cumulative, (1.0 - q) * total)) + 1)
+
+    best_value, best_box = float("-inf"), None
+    stride = max(1, int(knobs["box_stride"]))
+    for a in range(lo_edge, hi_edge + 1, stride):
+        for b in range(a, hi_edge + 1, stride):
+            value, _ = _box_value(cells, a, b, knobs)
+            if value > best_value:
+                best_value, best_box = value, (a, b)
+    if best_box is None:
+        return None
+    refine = max(0, int(knobs["box_refine"]))
+    a0, b0 = best_box
+    for a in range(max(lo_edge, a0 - refine), min(hi_edge, a0 + refine) + 1):
+        for b in range(max(a, b0 - refine), min(hi_edge, b0 + refine) + 1):
+            value, _ = _box_value(cells, a, b, knobs)
+            if value > best_value:
+                best_value, best_box = value, (a, b)
+
+    y0, y1 = best_box
+    value, bins = _box_value(cells, y0, y1, knobs, check=True)
+    if bins is None:
+        return None
+    # A box touching an end of the axis takes that end's overflow with it: the events are
+    # inside the selection the box stands for, and dropping them would make the written
+    # yield disagree with the cut the category claims to be.
+    y0 = 0 if y0 <= 1 else y0
+    y1 = ny + 1 if y1 >= ny else y1
+    return [{"y_range": (y0, y1), "x_ranges": bins}]
+
+
 def discover_binning(sig2d, bkg2d_by_name, knobs):
     """Find this category's binning, by whichever strategy the configuration names.
 
@@ -738,6 +935,8 @@ def discover_binning(sig2d, bkg2d_by_name, knobs):
                 f"({sorted(bkg2d_by_name)}), leaving nothing to bin against."
             )
         bkg2d_by_name = kept
+    if knobs["strategy"] == "hme_box":
+        return _discover_hme_box(sig2d, bkg2d_by_name, knobs)
     if knobs["strategy"] == "dp":
         return _discover_dp(sig2d, bkg2d_by_name, knobs)
     return _discover_greedy(sig2d, bkg2d_by_name, knobs)
@@ -778,7 +977,7 @@ def format_var_range(lo, hi, var):
     return f"{lo:.2f} < {var} < {hi:.2f}"
 
 
-def slice_ranges(x_axis, slices):
+def slice_ranges(x_axis, y_axis, slices):
     """Physical edges of the discovered slices on the sliced axis, as [[lo, hi], ...].
 
     The slice x_ranges are bin indices, and extend_outer_edges() has already pushed the
@@ -787,17 +986,42 @@ def slice_ranges(x_axis, slices):
     the plots can say which selection each slice actually is; nothing downstream of
     the datacards needs it.
     """
-    n = x_axis.GetNbins()
     ranges = []
     for sl in slices:
-        lo, hi = sl["x_range"]
+        (lo, hi), _, slice_axis = slice_parts(sl)
+        axis = x_axis if slice_axis == "x" else y_axis
+        n = axis.GetNbins()
         ranges.append(
             [
-                None if lo < 1 else x_axis.GetBinLowEdge(lo),
-                None if hi > n else x_axis.GetBinUpEdge(hi),
+                None if lo < 1 else axis.GetBinLowEdge(lo),
+                None if hi > n else axis.GetBinUpEdge(hi),
             ]
         )
     return ranges
+
+
+def _slice_record(sl, sel_edges, x_axis, y_axis):
+    """One category as plain data, in whichever layout produced it.
+
+    The key names say which axis is the selection and which carries the bins, so a reader
+    -- human or replay -- never has to infer it from the strategy that happened to run.
+    """
+    (lo, hi), bins, slice_axis = slice_parts(sl)
+    binned_axis = y_axis if slice_axis == "x" else x_axis
+    sel_key, bin_key = (
+        ("x_range", "y_ranges")
+        if slice_axis == "x"
+        else (
+            "y_range",
+            "x_ranges",
+        )
+    )
+    return {
+        sel_key: [lo, hi],
+        f"{slice_axis}_edges": sel_edges,
+        bin_key: [list(r) for r in bins],
+        ("y_edges" if slice_axis == "x" else "x_edges"): bin_edges(binned_axis, bins),
+    }
 
 
 def slices_to_record(slices, x_axis, y_axis, objective=None):
@@ -817,13 +1041,8 @@ def slices_to_record(slices, x_axis, y_axis, objective=None):
         "n_x_bins": x_axis.GetNbins(),
         "n_y_bins": y_axis.GetNbins(),
         "slices": [
-            {
-                "x_range": list(sl["x_range"]),
-                "x_edges": x_edges,
-                "y_ranges": [list(r) for r in sl["y_ranges"]],
-                "y_edges": bin_edges(y_axis, sl["y_ranges"]),
-            }
-            for sl, x_edges in zip(slices, slice_ranges(x_axis, slices))
+            _slice_record(sl, sel_edges, x_axis, y_axis)
+            for sl, sel_edges in zip(slices, slice_ranges(x_axis, y_axis, slices))
         ],
     }
     if objective is not None:
@@ -832,7 +1051,7 @@ def slices_to_record(slices, x_axis, y_axis, objective=None):
             "z": math.sqrt(max(total, 0.0)),
             "z2": total,
             "z2_per_slice": per_slice,
-            "n_bins": sum(len(sl["y_ranges"]) for sl in slices),
+            "n_bins": sum(len(slice_parts(sl)[1]) for sl in slices),
         }
     return record
 
@@ -856,10 +1075,17 @@ def record_to_slices(record, x_axis, y_axis, where):
                 "to this input."
             )
     return [
-        {
-            "x_range": tuple(sl["x_range"]),
-            "y_ranges": [tuple(r) for r in sl["y_ranges"]],
-        }
+        (
+            {
+                "y_range": tuple(sl["y_range"]),
+                "x_ranges": [tuple(r) for r in sl["x_ranges"]],
+            }
+            if "y_range" in sl
+            else {
+                "x_range": tuple(sl["x_range"]),
+                "y_ranges": [tuple(r) for r in sl["y_ranges"]],
+            }
+        )
         for sl in record["slices"]
     ]
 
@@ -874,7 +1100,60 @@ def _is_released(key, released):
     return any(key == name or key.startswith(name + "_") for name in released)
 
 
-def rebin_hist_2d(hist2d, slices, name, naming, fill_negative=None):
+def slice_parts(sl):
+    """(selection range, bin ranges, which axis the selection is on) for one category.
+
+    Two layouts reach this point. The DNN-sliced strategies cut x into categories and give
+    each a shape along y: {"x_range", "y_ranges"}. The HME-box strategy cuts y and gives
+    the one category a shape along x: {"y_range", "x_ranges"}. Everything downstream --
+    the writer, the record, the objective -- needs the same three things from either, and
+    asking here is what keeps that code from having to know which strategy ran.
+    """
+    if "y_range" in sl:
+        return sl["y_range"], sl["x_ranges"], "y"
+    return sl["x_range"], sl["y_ranges"], "x"
+
+
+def fitted_bins(cells, slices, knobs, name):
+    """([(content, error, first_fitted_fine_bin)] per bin, last measured fine bin).
+
+    Only the *fitted part* of each bin: the fine bins past the last measured one. The
+    rest of the bin stays with the era's own histogram, so a well-measured region keeps
+    its per-era shape and its systematic variations keep theirs -- replacing the whole
+    template with a scaled copy of the summed one would erase both.
+
+    The fit is derived from the discovery statistics -- the eras summed, which is what it
+    is constrained by -- and handed to each source era scaled by that era's own share of
+    the counted yield in the box. The share is a well-measured number even where the tail
+    is not, so each era keeps its own normalisation while the shape comes from the fit.
+    """
+    (y0, y1), bin_ranges, slice_axis = slice_parts(slices[0])
+    if slice_axis != "y":
+        return None
+    values, variances = cells.profile(name, max(y0, 0), min(y1, cells.ny + 1))
+    fitted, fitted_var, n, info = fitted_tail_full(
+        cells.x_centres, values, variances, knobs
+    )
+    if not n:
+        return None
+    replaced = set(info["replaced"])
+    out = []
+    for lo, hi in bin_ranges:
+        fine = range(max(lo, 0), min(hi, cells.nx + 1) + 1)
+        from_fit = [i for i in fine if i in replaced]
+        if not from_fit:
+            out.append((0.0, 0.0, None))
+            continue
+        # the fitted fine bins share the fit's three parameters, so their contributions
+        # to this bin's integral are propagated together rather than in quadrature
+        error = fitted_integral_error(
+            cells.x_centres, info["p"], info["cov"], from_fit
+        )
+        out.append((float(sum(fitted[i] for i in from_fit)), error, min(from_fit)))
+    return out
+
+
+def rebin_hist_2d(hist2d, slices, name, naming, fill_negative=None, override=None):
     """Given the discovered slice structure, produce one final TH1 per slice
     for this specific histogram (nominal or a systematic variation).
 
@@ -896,17 +1175,19 @@ def rebin_hist_2d(hist2d, slices, name, naming, fill_negative=None):
     background estimate."""
     outputs = []
     for slice_idx, sl in enumerate(slices):
-        xlo, xhi = sl["x_range"]
+        (sel_lo, sel_hi), bin_ranges, slice_axis = slice_parts(sl)
+        xlo, xhi = (sel_lo, sel_hi) if slice_axis == "x" else (None, None)
         # ROOT reinterprets an inverted or negative range as the full axis including
         # under/overflow, silently and with a plausible-looking positive yield, so an
         # invalid range must never reach IntegralAndError below. Checked here rather
         # than trusted because this is the last point where it is still cheap to say so.
-        if not 0 <= xlo <= xhi:
+        if not 0 <= sel_lo <= sel_hi:
             raise RuntimeError(
-                f"invalid x bin range ({xlo}, {xhi}) for slice {slice_idx} of {name}; "
-                "ROOT would read this as the whole plane."
+                f"invalid {slice_axis} bin range ({sel_lo}, {sel_hi}) for slice "
+                f"{slice_idx} of {name}; ROOT would read this as the whole plane."
             )
-        edges = array.array("d", bin_edges(hist2d.GetYaxis(), sl["y_ranges"]))
+        binned_axis = hist2d.GetYaxis() if slice_axis == "x" else hist2d.GetXaxis()
+        edges = array.array("d", bin_edges(binned_axis, bin_ranges))
         # Detached for the same reason as the projections above: Write() targets
         # gDirectory regardless, so nothing needs these to stay attached.
         h = _detach(
@@ -917,9 +1198,32 @@ def rebin_hist_2d(hist2d, slices, name, naming, fill_negative=None):
                 edges,
             )
         )
-        for bin_idx, (ylo, yhi) in enumerate(sl["y_ranges"], start=1):
+        for bin_idx, (blo, bhi) in enumerate(bin_ranges, start=1):
+            if override is not None:
+                fit_content, fit_error, first_fitted = override[bin_idx - 1]
+                if first_fitted is None:
+                    pass  # nothing fitted in this bin: counted, as any other histogram
+                else:
+                    content, error = fit_content, fit_error
+                    if first_fitted > blo:
+                        # the bin straddles the boundary: the measured part comes from
+                        # this era's own histogram, the rest from the fit
+                        err = array.array("d", [0.0])
+                        counted = hist2d.IntegralAndError(
+                            blo, first_fitted - 1, sel_lo, sel_hi, err
+                        )
+                        content += counted
+                        error = math.sqrt(error**2 + err[0] ** 2)
+                    h.SetBinContent(bin_idx, content)
+                    h.SetBinError(bin_idx, error)
+                    continue
             err = array.array("d", [0.0])
-            content = hist2d.IntegralAndError(xlo, xhi, ylo, yhi, err)
+            # the selection is on one axis and the bin on the other; IntegralAndError
+            # always wants (x_lo, x_hi, y_lo, y_hi)
+            if slice_axis == "x":
+                content = hist2d.IntegralAndError(sel_lo, sel_hi, blo, bhi, err)
+            else:
+                content = hist2d.IntegralAndError(blo, bhi, sel_lo, sel_hi, err)
             error = err[0]
             if fill_negative is not None and content < 0:
                 content = fill_negative
@@ -1044,7 +1348,48 @@ def process_category(
     # side-car path to hand a reader correctly and no key name for the two ends to agree
     # on -- anything that can open the shapes can already read it.
     naming = cfg["naming"]
-    ranges = slice_ranges(disc_sig.GetXaxis(), slices)
+    ranges = slice_ranges(disc_sig.GetXaxis(), disc_sig.GetYaxis(), slices)
+
+    # Processes whose tail is written from the fit rather than counted, and the summed
+    # counted yield each one has in the box, which is what the per-era scaling is against.
+    fit_bins, summed_nominal, fit_err_norm = {}, {}, {}
+    if knobs.get("_fit_tail_active") and len(slices) == 1:
+        cells_for_fit = build_cells(disc_sig, disc_bkg_by_name)
+        (fy0, fy1), _, faxis = slice_parts(slices[0])
+        for name in knobs["fit_tail_processes"]:
+            if name not in disc_bkg_by_name or faxis != "y":
+                continue
+            template = fitted_bins(cells_for_fit, slices, knobs, name)
+            if template is None:
+                continue
+            values, _ = cells_for_fit.profile(
+                name, max(fy0, 0), min(fy1, cells_for_fit.ny + 1)
+            )
+            fit_bins[name] = template
+            summed_nominal[name] = float(values.sum())
+            # Each source era is written as the same fitted shape scaled by its own share
+            # of the counted yield, so the four templates' errors are fully correlated --
+            # but the datacard sums the eras and adds their errors in quadrature. Scaling
+            # each era's error by f/sqrt(sum f^2) rather than by f makes that quadrature
+            # sum come out at the fit's actual uncertainty instead of ~half of it.
+            fractions = []
+            for _, era_file, _ in sources:
+                era_hist = get_hist(era_file, prefix + name)
+                fractions.append(
+                    era_hist.Integral(0, era_hist.GetNbinsX() + 1, fy0, fy1)
+                    / summed_nominal[name]
+                    if era_hist is not None and summed_nominal[name]
+                    else 0.0
+                )
+            norm = math.sqrt(sum(f * f for f in fractions))
+            fit_err_norm[name] = norm if norm > 0 else 1.0
+            fitted_total = sum(c for c, _, first in template if first is not None)
+            print(
+                f"    [fit] {channel}/{category} {param_name}={mass}: {name} tail fitted "
+                f"in {sum(1 for _, _, first in template if first is not None)} of "
+                f"{len(template)} bins, {fitted_total:.2f} events of a box yield "
+                f"{summed_nominal[name]:.2f}"
+            )
 
     # One shared set of edges, applied to every source era in its own file.
     for source_era, in_file, out_file in sources:
@@ -1062,6 +1407,27 @@ def process_category(
             hist2d = get_hist(in_file, prefix + key)
             if hist2d is None or hist2d.GetDimension() != 2:
                 continue
+            override = None
+            base_proc = key.split("_")[0] if "_" in key else key
+            if fit_bins and base_proc in fit_bins:
+                template = fit_bins[base_proc]
+                # This era's share of the counted yield in the box -- and for a
+                # systematic variation, its size relative to the nominal, so the
+                # variation keeps the effect it describes where the fit supplies the
+                # shape. Errors scale by f/sqrt(sum f^2) rather than f: every era carries
+                # the same fitted shape, so their errors are fully correlated, while the
+                # datacard adds them in quadrature when it sums the eras.
+                (ylo, yhi), _, _ = slice_parts(slices[0])
+                era_total = hist2d.Integral(0, hist2d.GetNbinsX() + 1, ylo, yhi)
+                scale = (
+                    era_total / summed_nominal[base_proc]
+                    if summed_nominal.get(base_proc)
+                    else 0.0
+                )
+                err_scale = scale / fit_err_norm[base_proc]
+                override = [
+                    (c * scale, e * err_scale, first) for c, e, first in template
+                ]
             for slice_idx, h in enumerate(
                 rebin_hist_2d(
                     hist2d,
@@ -1075,6 +1441,7 @@ def process_category(
                         )
                         else None
                     ),
+                    override,
                 )
             ):
                 out_file.cd(f"{channel}/{naming.name(category, slice_idx)}")
@@ -1201,6 +1568,14 @@ def run(
                 frozen = None
                 if frozen_binning is not None:
                     frozen = lookup_frozen(frozen_binning, era, mass, channel, category)
+                # Whether this category's fit-tail processes are fitted here. Decided
+                # by the category, so a configuration can fit where DY is measurable
+                # (res2b) and count it where it is not (boosted).
+                cat_knobs = dict(
+                    knobs,
+                    _fit_tail_active=bool(knobs["fit_tail_processes"])
+                    and category in knobs["fit_tail_categories"],
+                )
                 used = process_category(
                     sources,
                     channel,
@@ -1209,7 +1584,7 @@ def run(
                     mass,
                     era,
                     discovery_files,
-                    knobs,
+                    cat_knobs,
                     frozen=frozen,
                     replaying=frozen_binning is not None,
                 )

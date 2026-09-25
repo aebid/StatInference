@@ -143,13 +143,42 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
                     base_dir_local.abspath, config, local_output.abspath
                 )
 
-    def plot_variable(self, variable):
+    @staticmethod
+    def _surviving_axis(base_dir):
+        """Which axis of the 2D input the rebinned shapes are binned along: 0 = x, 1 = y.
+
+        Read off the binning record the preprocess step wrote beside the shapes. A DNN
+        slice selects on x and bins y; an HME box (a slice with a "y_range") selects on y
+        and bins x. With no record the shapes are the DNN-sliced kind, whose surviving
+        axis is y -- which is also what this assumed before boxes existed.
+        """
+        import json
+
+        path = os.path.join(base_dir, "binning.json")
+        try:
+            with open(path) as f:
+                record = json.load(f)
+        except (OSError, ValueError):
+            return 1
+        node = record.get("binning", {})
+        # era -> mass -> channel -> category -> {"slices": [...]}
+        while isinstance(node, dict) and "slices" not in node:
+            if not node:
+                return 1
+            node = next(iter(node.values()))
+        slices = node.get("slices") if isinstance(node, dict) else None
+        return 0 if slices and "y_range" in slices[0] else 1
+
+    def plot_variable(self, variable, axis=1):
         """The variable whose axis the shapes are binned along, for histograms.yaml.
 
-        For input a 2D->1D rebinning produced, that is the y variable of the 2D entry --
-        histograms.yaml records both as ``var_list: [x, y]``, so the axis metadata the
-        plotter needs is already described and does not have to be restated here. For
-        input that was always 1D, the variable is its own answer.
+        For input a 2D->1D rebinning produced, that is one of the two variables of the 2D
+        entry -- histograms.yaml records both as ``var_list: [x, y]``, so the axis
+        metadata the plotter needs is already described and does not have to be restated
+        here. `axis` picks which, from _surviving_axis(): the DNN-sliced shapes keep y
+        (HME), an HME box keeps x (the DNN). Taking y unconditionally labelled every box
+        panel "Deep HME Mass" under DNN-score bins. For input that was always 1D, the
+        variable is its own answer.
         """
         try:
             import FLAF.Common.Setup as Setup
@@ -157,7 +186,7 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
             hists = Setup.Setup(self.ana_path(), self.period, self.version).hists
             var_list = hists[variable].get("var_list")
             if var_list and len(var_list) > 1:
-                return var_list[1]
+                return var_list[axis]
         except Exception as e:
             print(f"Warning: no var_list for {variable} ({e}); plotting it as itself")
         return variable
@@ -175,13 +204,27 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
         `panels` is [[path or None, ...] per column] per row; a None leaves its cell blank,
         which is what keeps column N under column N when a slice was skipped.
         """
-        from pypdf import PageObject, PdfReader, PdfWriter, Transformation
+        from pypdf import PdfWriter
+
+        sheet = CreateDatacardsTask._grid_page(panels)
+        if sheet is None:
+            return False
+        writer = PdfWriter()
+        writer.add_page(sheet)
+        with open(out_path, "wb") as f:
+            writer.write(f)
+        return True
+
+    @staticmethod
+    def _grid_page(panels):
+        """The page _stitch_grid() writes, returned rather than written. None if empty."""
+        from pypdf import PageObject, PdfReader, Transformation
 
         pages = {
             p: PdfReader(p).pages[0] for row in panels for p in row if p is not None
         }
         if not pages:
-            return False
+            return None
         w = max(float(p.mediabox.width) for p in pages.values())
         h = max(float(p.mediabox.height) for p in pages.values())
         n_rows, n_cols = len(panels), max(len(r) for r in panels)
@@ -196,37 +239,178 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
                     pages[path],
                     Transformation().translate(c * w, (n_rows - 1 - r) * h),
                 )
+        return sheet
+
+    def _write_book(self, cfg, plots_dir, per_variable):
+        """Every datacard bin of every mass in one PDF, one page per mass.
+
+        A page is the channels down and every category across -- all the distributions the
+        fit sees at that mass, side by side. The columns are the union over all masses, in
+        configuration order, so a category absent at one mass (boosted at low mass, say)
+        leaves a blank column rather than shifting the others: column N is the same
+        category on every page. Each page is bookmarked with its variable.
+
+        `per_variable` is [(variable, {key: panel path}, present)], one per mass.
+        """
+        from pypdf import PdfWriter
+
+        naming = CategoryNaming.fromConfig(cfg)
+        base_order = {}
+        for category in cfg["categories"]:
+            region, _, cat = category.rpartition("/")
+            base_order.setdefault((region, naming.base(cat)), len(base_order))
+
+        def column_key(region_cat):
+            region, cat = region_cat
+            base, idx = naming.split(cat)
+            return (
+                base_order.get((region, base), len(base_order)),
+                -1 if idx is None else idx,
+                cat,
+            )
+
+        columns = sorted(
+            {(region, cat) for _, _, present in per_variable for _, region, cat in present},
+            key=column_key,
+        )
+        if not columns:
+            return None
+
+        def mass_of(variable):
+            digits = "".join(ch if ch.isdigit() else " " for ch in variable).split()
+            return int(digits[0]) if digits else 0
+
         writer = PdfWriter()
-        writer.add_page(sheet)
-        with open(out_path, "wb") as f:
+        for variable, panel_of_key, _ in sorted(
+            per_variable, key=lambda v: (mass_of(v[0]), v[0])
+        ):
+            panels = [
+                [
+                    (lambda p: p if p and os.path.exists(p) else None)(
+                        panel_of_key.get(f"{channel}:{cat}:{region}")
+                    )
+                    for region, cat in columns
+                ]
+                for channel in cfg["channels"]
+            ]
+            sheet = self._grid_page(panels)
+            if sheet is None:
+                continue
+            writer.add_page(sheet)
+            writer.add_outline_item(variable, len(writer.pages) - 1)
+        if not writer.pages:
+            return None
+        out = os.path.join(plots_dir, "all_shapes.pdf")
+        with open(out, "wb") as f:
             writer.write(f)
-        return True
+        print(f"Wrote {out} ({len(writer.pages)} pages)")
+        return out
 
     @staticmethod
     def _present_keys(shape_file, cfg):
-        """The (channel, region, category) triples the summed shape file actually holds."""
+        """The (channel, region, category) triples the summed shape file actually holds.
+
+        The names are read out of the file rather than taken from `categories:`, because
+        a configuration may list either the sliced datacard bins ("SR/res2b_dnn0") or the
+        base categories they are cut from ("SR/res2b") -- the datacard maker expands the
+        latter from the binning record, and plotting has to agree with it. Taking the
+        names from the shapes needs no such agreement: whatever the maker wrote is what
+        gets plotted, and a configuration in either style works unchanged.
+
+        A configured entry matches a directory when it *is* that directory or is the base
+        it was sliced from, so listing "SR/res2b" never drags in "SR/res2b2".
+        """
         ROOT = importROOT()
+        naming = CategoryNaming.fromConfig(cfg)
+        wanted = {
+            (category.rpartition("/")[0], naming.base(category.rpartition("/")[2]))
+            for category in cfg["categories"]
+        }
         present = set()
         f = ROOT.TFile.Open(shape_file)
         if not f or f.IsZombie():
             return present
         try:
-            for category in cfg["categories"]:
-                region, _, cat = category.rpartition("/")
-                for channel in cfg["channels"]:
-                    path = "/".join(x for x in (channel, region, cat) if x)
-                    if f.Get(path):
-                        present.add((channel, region, cat))
+            for channel in cfg["channels"]:
+                ch_dir = f.Get(channel)
+                if not ch_dir:
+                    continue
+                for region_key in ch_dir.GetListOfKeys():
+                    region_dir = region_key.ReadObj()
+                    if not region_dir.InheritsFrom("TDirectory"):
+                        continue
+                    region = region_key.GetName()
+                    for cat_key in region_dir.GetListOfKeys():
+                        if not cat_key.ReadObj().InheritsFrom("TDirectory"):
+                            continue
+                        cat = cat_key.GetName()
+                        if (region, naming.base(cat)) in wanted:
+                            present.add((channel, region, cat))
         finally:
             f.Close()
         return present
 
-    def _stitch_grids(self, cfg, plots_dir, variable, panel_of_key):
+    @staticmethod
+    def _selection_labels(shape_file, present):
+        """{"channel:cat:region": selection} from the category directories' own titles.
+
+        The rebinning step titles each slice directory with the cut it stands for
+        ("710.00 < HME < 940.00" for an HME box, the DNN range for a DNN slice), so the
+        label travels with the shapes and nothing here has to re-derive it. Empty for a
+        category that was never sliced.
+        """
+        ROOT = importROOT()
+        labels = {}
+        f = ROOT.TFile.Open(shape_file)
+        if not f or f.IsZombie():
+            return labels
+        try:
+            for channel, region, cat in present:
+                d = f.Get(f"{channel}/{region}/{cat}")
+                title = d.GetTitle() if d else ""
+                if title and title != cat:
+                    labels[f"{channel}:{cat}:{region}"] = title
+        finally:
+            f.Close()
+        return labels
+
+    @staticmethod
+    def _stamp(pdf_path, text):
+        """Write `text` onto a HistPlotter panel, as one more line of its label column.
+
+        Drawn as a transparent overlay rather than passed to HistPlotter, which has no
+        hook for per-plot free text and belongs to FLAF. The position is the line below
+        the region label in HistPlotter's layout.
+        """
+        import io
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from pypdf import PdfReader, PdfWriter
+
+        reader = PdfReader(pdf_path)
+        page = reader.pages[0]
+        w, h = float(page.mediabox.width), float(page.mediabox.height)
+        fig = plt.figure(figsize=(w / 72.0, h / 72.0))
+        fig.patch.set_alpha(0.0)
+        fig.text(0.164, 0.665, text, fontsize=9, ha="left", va="center")
+        buf = io.BytesIO()
+        fig.savefig(buf, format="pdf", transparent=True)
+        plt.close(fig)
+        buf.seek(0)
+        page.merge_page(PdfReader(buf).pages[0])
+        writer = PdfWriter()
+        writer.add_page(page)
+        with open(pdf_path, "wb") as f:
+            writer.write(f)
+
+    def _stitch_grids(self, cfg, plots_dir, variable, panel_of_key, present):
         """One grid per base category: its slices across, the channels down."""
         naming = CategoryNaming.fromConfig(cfg)
         bases = {}
-        for category in cfg["categories"]:
-            region, _, cat = category.rpartition("/")
+        for _, region, cat in present:
             base, slice_idx = naming.split(cat)
             bases.setdefault((region, base), {})[slice_idx] = cat
         for (region, base), slices in bases.items():
@@ -265,6 +449,7 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
         plots_dir = os.path.join(output_dir, "plots")
         os.makedirs(plots_dir, exist_ok=True)
         plotter = os.path.join(self.ana_path(), "FLAF", "Analysis", "HistPlotter.py")
+        per_variable = []
 
         # The datacard bin is the sum over the sub-eras (getCombinedShape does the same at
         # card-build time), so the sub-era files are hadd'ed into the one file the plotter
@@ -297,19 +482,13 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
             # after the gap, not just the missing one.
             present = self._present_keys(summed, cfg)
             keys, outputs = [], []
-            for category in cfg["categories"]:
-                # "SR/res2b_dnn0" -> region "SR", category "res2b_dnn0": HistPlotter
-                # navigates channel -> region -> category.
-                region, _, cat = category.rpartition("/")
-                for channel in cfg["channels"]:
-                    if (channel, region, cat) not in present:
-                        continue
-                    keys.append(f"{channel}:{cat}:{region}")
-                    outputs.append(
-                        os.path.join(
-                            plots_dir, f"{variable}_{channel}_{region}_{cat}.pdf"
-                        )
-                    )
+            # HistPlotter navigates channel -> region -> category, and `present` already
+            # holds exactly the triples the file has, in the maker's own naming.
+            for channel, region, cat in sorted(present):
+                keys.append(f"{channel}:{cat}:{region}")
+                outputs.append(
+                    os.path.join(plots_dir, f"{variable}_{channel}_{region}_{cat}.pdf")
+                )
             if not keys:
                 print(f"WARNING: no shapes to plot for {variable}")
                 continue
@@ -332,7 +511,7 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
                 # binning -- so no --rebin, which would coarsen it back to the histograms.yaml
                 # grid and undo the whole point of the rebinning.
                 "--var",
-                self.plot_variable(variable),
+                self.plot_variable(variable, self._surviving_axis(base_dir)),
                 # The plotted shapes are the sum over every sub-era, so the label has to
                 # name the combination: HistPlotter reads config/plot/<year>.yaml for the
                 # luminosity, and a sub-era's file states that sub-era's luminosity alone.
@@ -354,7 +533,16 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
             ]
             try:
                 ps_call(cmd, verbose=1)
-                self._stitch_grids(cfg, plots_dir, variable, dict(zip(keys, outputs)))
+                # the selection each panel stands for -- for an HME box, its window --
+                # stamped on before the grids and the book are assembled from the panels
+                for key, label in self._selection_labels(summed, present).items():
+                    path = dict(zip(keys, outputs)).get(key)
+                    if path and os.path.exists(path):
+                        self._stamp(path, label)
+                self._stitch_grids(
+                    cfg, plots_dir, variable, dict(zip(keys, outputs)), present
+                )
+                per_variable.append((variable, dict(zip(keys, outputs)), present))
             except Exception as e:
                 # The datacards are the product that matters; a plotting failure should be
                 # loud but must not leave the task looking broken with valid cards on disk.
@@ -365,3 +553,8 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
             finally:
                 if os.path.exists(summed):
                     os.remove(summed)
+
+        try:
+            self._write_book(cfg, plots_dir, per_variable)
+        except Exception as e:
+            print(f"WARNING: could not assemble the all-masses shape book: {e}")

@@ -1234,6 +1234,46 @@ def rebin_hist_2d(hist2d, slices, name, naming, fill_negative=None, override=Non
     return outputs
 
 
+def as_2d(hist):
+    """A 1D input as the 2D shape the binning reads: x is the input's own axis, and y a
+    single bin standing for the whole of the axis the input does not have.
+
+    This is how a 1D discriminant takes the same binning as the 2D DNN-vs-HME shapes
+    with nothing written twice. Every strategy then sees one y bin. hme_box's box can
+    only be that bin, which it widens to take the overflow, so what is left is its DNN
+    binning inside the box -- the same partition, floors and marginal-gain trim -- on
+    the full input. The written shapes are 1D along x, as they are from a 2D input.
+
+    2D histograms pass through; anything else (None, 3D) comes back as None, which the
+    callers already treat as absent.
+    """
+    if hist is None:
+        return None
+    if hist.GetDimension() == 2:
+        return hist
+    if hist.GetDimension() != 1:
+        return None
+    x_axis = hist.GetXaxis()
+    nx = x_axis.GetNbins()
+    edges = array.array("d", [x_axis.GetBinLowEdge(i) for i in range(1, nx + 2)])
+    h2 = ROOT.TH2D(
+        f"{hist.GetName()}_as2d",
+        hist.GetTitle(),
+        nx,
+        edges,
+        1,
+        array.array("d", [0.0, 1.0]),
+    )
+    h2.SetDirectory(0)
+    h2.Sumw2()
+    h2.GetXaxis().SetTitle(x_axis.GetTitle())
+    for i in range(0, nx + 2):
+        h2.SetBinContent(i, 1, hist.GetBinContent(i))
+        h2.SetBinError(i, 1, hist.GetBinError(i))
+    h2.SetEntries(hist.GetEntries())
+    return h2
+
+
 def process_category(
     sources,
     channel,
@@ -1265,12 +1305,16 @@ def process_category(
     # The resonance parameter is named by the configuration, not by this script -- it is
     # "MX" for bbWW but the slicing knows nothing about which parameter it is scanning.
     param_name = cfg["signal_param_name"]
-    prefix = f"{channel}/{category}/"
+    # Read from where the input keeps this category for this mass, written under the
+    # category's own name -- so the output, binning.json and the datacard bins are the
+    # same for every mass even when the input's directory is not (see InputCategories).
+    in_dir = f"{channel}/{cfg['input_categories'].path(category, {param_name: mass})}"
+    prefix = f"{in_dir}/"
     # The key list comes from the first source era; a systematic that only some eras carry
     # is filled in from their nominal when the slices are written below.
-    cat_dir = sources[0][1].Get(f"{channel}/{category}")
+    cat_dir = sources[0][1].Get(in_dir)
     if not cat_dir:
-        print(f"  [skip] {channel}/{category}: not found in {sources[0][1].GetName()}")
+        print(f"  [skip] {in_dir}: not found in {sources[0][1].GetName()}")
         return
 
     signal_keys = [
@@ -1284,7 +1328,7 @@ def process_category(
     ]
 
     def load2d(f, key):
-        return get_hist(f, prefix + key)
+        return as_2d(get_hist(f, prefix + key))
 
     disc_sig = sum_hists(
         [load2d(f, key) for f in discovery_files for key in signal_keys]
@@ -1374,7 +1418,7 @@ def process_category(
             # sum come out at the fit's actual uncertainty instead of ~half of it.
             fractions = []
             for _, era_file, _ in sources:
-                era_hist = get_hist(era_file, prefix + name)
+                era_hist = as_2d(get_hist(era_file, prefix + name))
                 fractions.append(
                     era_hist.Integral(0, era_hist.GetNbinsX() + 1, fy0, fy1)
                     / summed_nominal[name]
@@ -1399,13 +1443,13 @@ def process_category(
                 f"{channel}/{naming.name(category, slice_idx)}",
                 format_var_range(*ranges[slice_idx], var=cfg["slice_var"]),
             )
-        cat_dir = in_file.Get(f"{channel}/{category}")
+        cat_dir = in_file.Get(in_dir)
         if not cat_dir:
-            print(f"  [skip] {source_era} {channel}/{category}: not in the input")
+            print(f"  [skip] {source_era} {in_dir}: not in the input")
             continue
         for key in [k.GetName() for k in cat_dir.GetListOfKeys()]:
-            hist2d = get_hist(in_file, prefix + key)
-            if hist2d is None or hist2d.GetDimension() != 2:
+            hist2d = as_2d(get_hist(in_file, prefix + key))
+            if hist2d is None:
                 continue
             override = None
             base_proc = key.split("_")[0] if "_" in key else key

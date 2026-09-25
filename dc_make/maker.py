@@ -13,6 +13,7 @@ from StatInference.common.tools import (
     resolveNegativeBins,
     getRelevantBins,
     CategoryNaming,
+    InputCategories,
 )
 from .process import Process
 from .uncertainty import (
@@ -69,6 +70,16 @@ class DatacardMaker:
         # group the slices of one base category.
         self.naming = CategoryNaming.fromConfig(cfg)
         self.categories = self._resolveCategories(list(cfg["categories"]))
+        # Where each category's shapes sit in the input, when that depends on the model
+        # point; see InputCategories. Checked against the configured names, not the
+        # resolved ones: the map is keyed on what the configuration wrote.
+        self.input_categories = InputCategories.fromConfig(cfg)
+        unknown = self.input_categories.unknown(cfg["categories"])
+        if unknown:
+            raise RuntimeError(
+                f"input_categories maps {unknown}, which are not configured categories "
+                f"({list(cfg['categories'])})"
+            )
         self.signalFractionForRelevantBins = cfg["signalFractionForRelevantBins"]
 
         self.era_groups = cfg.get("era_groups", {})
@@ -368,6 +379,11 @@ class DatacardMaker:
             self.processes.keys(), param_bins, self.eras, self.channels, self.categories
         )
 
+    def histDir(self, channel, category, model_params):
+        """The input directory holding one bin's histograms. The category is the bin's
+        own name unless `input_categories` places it per model point."""
+        return f"{channel}/{self.input_categories.path(category, model_params)}"
+
     def getInputFile(self, era, model_params):
         file_name = self.model.getInputFileName(era, model_params)
         if file_name not in self.input_files:
@@ -428,7 +444,7 @@ class DatacardMaker:
                     channel,
                     category,
                     model_params,
-                    f"{channel}/{category}/{subp}",
+                    f"{self.histDir(channel, category, model_params)}/{subp}",
                 )
                 sub_yield = hist.Integral(1, hist.GetNbinsX() + 1)
                 if sub_yield <= 0:
@@ -523,7 +539,7 @@ class DatacardMaker:
                 channel,
                 category,
                 model_params,
-                f"{channel}/{category}/{hist_name_suffix}",
+                f"{self.histDir(channel, category, model_params)}/{hist_name_suffix}",
             )
             unc_value = self._getLnNValue(
                 unc, process, proc_name_for_unc, sub_era, channel, category
@@ -807,11 +823,12 @@ class DatacardMaker:
                         "this bin."
                     )
             else:
-                hist_name = f"{channel}/{category}/{process.hist_name}"
+                hist_dir = self.histDir(channel, category, model_params)
+                hist_name = f"{hist_dir}/{process.hist_name}"
                 hists = []
                 if process.subprocesses:
                     for subp in process.subprocesses:
-                        hist_name = f"{channel}/{category}/{subp}"
+                        hist_name = f"{hist_dir}/{subp}"
                         if unc_name and unc_scale:
                             hist_name += f"_{unc_name}_{unc_scale}"
                         subhist = self.readHist(file, hist_name)
@@ -1051,7 +1068,9 @@ class DatacardMaker:
         MC -- e.g. a standalone single-era limit for a sparse category/channel
         that only has signal statistics once combined with other eras."""
         sub_eras = self.getSubEras(era) if self.isMetaEra(era) else [era]
-        hist_name = f"{channel}/{category}/{process.hist_name}"
+        hist_name = (
+            f"{self.histDir(channel, category, process.params)}/{process.hist_name}"
+        )
         for sub_era in sub_eras:
             _, file = self.getInputFile(sub_era, process.params)
             obj = self.readHist(file, hist_name)

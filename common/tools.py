@@ -101,6 +101,58 @@ class CategoryNaming:
         return self.split(category)[0]
 
 
+class InputCategories:
+    """Where a category's shapes live in the input file, when that is not its own name.
+
+    A datacard category is one name for every model point: it names the bin, the
+    per-category datacard directory, and what Process/Uncertainty scoping matches
+    against. Some inputs do not store it under one name. The HH->bbWW single-lepton
+    shapes hold, in the file for mass MX, a region for every mass (SR_SL_M300 ...
+    SR_SL_M1000), and only SR_SL_M${MX} is the one the MX hypothesis selected. Listing
+    those as categories would put all ten into every datacard as separate bins -- every
+    file has all of them, so nothing would ever report one missing.
+
+    So the configuration maps a category to its input directory, with the model's
+    parameters substituted at read time:
+
+        input_categories:
+          SR_SL/res2b: SR_SL_M${MX}/res2b
+
+    Only exact names are mapped. A sliced name (SR_SL/res2b_hmebox0) is read from shapes
+    a preprocessing step has already written under the category's own name, so it
+    passes through, as does every category of a configuration that declares no map.
+    """
+
+    def __init__(self, mapping=None):
+        mapping = mapping or {}
+        if not isinstance(mapping, dict):
+            raise RuntimeError(
+                f"input_categories must map category -> input directory, got {mapping!r}"
+            )
+        self.mapping = {str(k): str(v) for k, v in mapping.items()}
+
+    @classmethod
+    def fromConfig(cls, cfg):
+        return cls(cfg.get("input_categories"))
+
+    def unknown(self, categories):
+        """Mapped names that are not among the configuration's categories -- a typo
+        there would otherwise leave the category read from its own name, silently."""
+        return sorted(set(self.mapping) - set(categories))
+
+    def path(self, category, params):
+        """The directory holding `category` for model point `params` ({"MX": 500})."""
+        pattern = self.mapping.get(category, category)
+        for name, value in (params or {}).items():
+            pattern = pattern.replace("${" + name + "}", str(value))
+        if "${" in pattern:
+            raise RuntimeError(
+                f"input category '{pattern}' for '{category}' still has an unresolved "
+                f"parameter after substituting {dict(params or {})}"
+            )
+        return pattern
+
+
 class PackageWrapper:
     def __init__(self, import_fn):
         self._package = None

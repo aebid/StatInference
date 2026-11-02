@@ -1,129 +1,96 @@
-"""common/card_config.py: a datacard configuration built on another (`extends`) with `variables`."""
+"""common/card_config.py: a datacard configuration and its `spins:` axis."""
 
 import os
 import tempfile
 import textwrap
 import unittest
 
-from StatInference.common.card_config import load_card_config
+from StatInference.common.card_config import card_spins, load_card_config
+
+CARD = """
+spins:
+  0: { SIGNAL_MODEL: GluGluToRadion, SPIN_NAME: radion }
+  2: { SIGNAL_MODEL: GluGluToBulkGraviton, SPIN_NAME: graviton }
+analysis: hh
+channels: [ eE, muMu ]
+processes:
+  - process: ${SIGNAL_MODEL}_bbWW_${MX}
+    is_signal: true
+  - TT
+uncertainties:
+  - name: BR_hbb
+    processes: [ "^${SIGNAL_MODEL}_" ]
+limit_plots:
+  - name: spin${SPIN}_limits
+    datacards: [ { name: "spin-${SPIN} (${SPIN_NAME})", glob: "${ERA}/*.txt" } ]
+    external_limits: [ "run2_spin${SPIN}.json" ]
+model: { parameters: [ MX ], input_file_pattern: "${ERA}/m${MX}.root" }
+label: "$BIN"
+"""
 
 
 class CardConfigTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.dir = self.tmp.name
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def write(self, name, text):
-        path = os.path.join(self.dir, name)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+    def write(self, text, name="card.yaml"):
+        path = os.path.join(self.tmp.name, name)
         with open(path, "w") as f:
             f.write(textwrap.dedent(text))
         return path
 
-    def base(self):
-        return self.write(
-            "base.yaml",
-            """
-            variables: { SIGNAL: GluGluToRadion, SPIN: 0 }
-            analysis: hh
-            channels: [ eE, muMu ]
-            processes:
-              - process: ${SIGNAL}_bbWW_${MX}
-                is_signal: true
-              - TT
-            uncertainties:
-              - name: lumi
-                processes: [ "^${SIGNAL}_" ]
-                value: 1.01
-            limit_plots:
-              - name: spin${SPIN}
-                files: [ "run2_spin${SPIN}.json" ]
-                glob: "${ERA}/*.txt"
-            model: { parameters: [ MX ], input_file_pattern: "${ERA}/m${MX}.root" }
-            """,
-        )
-
-    def test_a_card_without_extends_or_variables_is_read_as_is(self):
-        path = self.write(
-            "plain.yaml", "analysis: hh\nchannels: [ eE ]\nlabel: '$BIN ${MX}'\n"
-        )
-        self.assertEqual(
-            load_card_config(path),
-            {"analysis": "hh", "channels": ["eE"], "label": "$BIN ${MX}"},
-        )
-
-    def test_variables_are_substituted_and_other_placeholders_kept(self):
-        cfg = load_card_config(self.base())
-        self.assertNotIn("variables", cfg)
-        self.assertEqual(cfg["processes"][0]["process"], "GluGluToRadion_bbWW_${MX}")
-        self.assertEqual(cfg["uncertainties"][0]["processes"], ["^GluGluToRadion_"])
-        self.assertEqual(cfg["limit_plots"][0]["name"], "spin0")
-        self.assertEqual(cfg["limit_plots"][0]["files"], ["run2_spin0.json"])
-        self.assertEqual(cfg["limit_plots"][0]["glob"], "${ERA}/*.txt")
-        self.assertEqual(cfg["model"]["input_file_pattern"], "${ERA}/m${MX}.root")
-
-    def test_extends_overrides_a_variable_of_the_base(self):
-        self.base()
-        path = self.write(
-            "sub/spin2.yaml",
-            """
-            extends: ../base.yaml
-            variables: { SIGNAL: GluGluToBulkGraviton, SPIN: 2 }
-            """,
-        )
+    def test_a_card_without_spins_is_read_as_is(self):
+        path = self.write("analysis: hh\nchannels: [ eE ]\nlabel: '$BIN ${MX}'\n")
         cfg = load_card_config(path)
-        self.assertNotIn("extends", cfg)
         self.assertEqual(
-            cfg["processes"][0]["process"], "GluGluToBulkGraviton_bbWW_${MX}"
+            cfg, {"analysis": "hh", "channels": ["eE"], "label": "$BIN ${MX}"}
         )
-        self.assertEqual(
-            cfg["uncertainties"][0]["processes"], ["^GluGluToBulkGraviton_"]
-        )
-        self.assertEqual(cfg["limit_plots"][0]["name"], "spin2")
-        self.assertEqual(cfg["channels"], ["eE", "muMu"])
+        self.assertEqual(card_spins(cfg), [None])
+        with self.assertRaisesRegex(ValueError, "declares no spins"):
+            load_card_config(path, "0")
 
-    def test_merge_rules(self):
-        self.base()
-        path = self.write(
-            "over.yaml",
-            """
-            extends: base.yaml
-            channels: [ eMu ]
-            model: { parameters: [ MY ] }
-            limit_plots: null
-            new_key: 3
-            """,
-        )
-        cfg = load_card_config(path)
-        self.assertEqual(cfg["channels"], ["eMu"])  # a list replaces
-        self.assertEqual(cfg["model"]["parameters"], ["MY"])  # a mapping merges ...
-        self.assertEqual(
-            cfg["model"]["input_file_pattern"], "${ERA}/m${MX}.root"
-        )  # ... key by key
-        self.assertNotIn("limit_plots", cfg)  # null removes
-        self.assertEqual(cfg["new_key"], 3)
+    def test_the_spins_in_their_order(self):
+        cfg = load_card_config(self.write(CARD))
+        self.assertEqual(card_spins(cfg), ["0", "2"])
+        # as written: the spin values are not substituted
+        self.assertEqual(cfg["processes"][0]["process"], "${SIGNAL_MODEL}_bbWW_${MX}")
 
-    def test_a_chain_of_extends(self):
-        self.base()
-        self.write("mid.yaml", "extends: base.yaml\nanalysis: mid\n")
-        cfg = load_card_config(
-            self.write("top.yaml", "extends: mid.yaml\nchannels: [ eMu ]\n")
-        )
-        self.assertEqual((cfg["analysis"], cfg["channels"]), ("mid", ["eMu"]))
-        self.assertEqual(cfg["processes"][0]["process"], "GluGluToRadion_bbWW_${MX}")
+    def test_the_card_of_a_spin(self):
+        path = self.write(CARD)
+        for spin, model, name in (
+            ("0", "GluGluToRadion", "radion"),
+            (2, "GluGluToBulkGraviton", "graviton"),
+        ):
+            cfg = load_card_config(path, spin)
+            self.assertNotIn("spins", cfg)
+            self.assertEqual(cfg["processes"][0]["process"], f"{model}_bbWW_${{MX}}")
+            self.assertEqual(cfg["uncertainties"][0]["processes"], [f"^{model}_"])
+            plot = cfg["limit_plots"][0]
+            self.assertEqual(plot["name"], f"spin{spin}_limits")
+            self.assertEqual(plot["datacards"][0]["name"], f"spin-{spin} ({name})")
+            self.assertEqual(plot["external_limits"], [f"run2_spin{spin}.json"])
+            # placeholders that are not spin values are left for later
+            self.assertEqual(plot["datacards"][0]["glob"], "${ERA}/*.txt")
+            self.assertEqual(cfg["model"]["input_file_pattern"], "${ERA}/m${MX}.root")
+            self.assertEqual(cfg["label"], "$BIN")
+            self.assertEqual(cfg["channels"], ["eE", "muMu"])
 
     def test_errors(self):
-        self.write("a.yaml", "extends: b.yaml\n")
-        self.write("b.yaml", "extends: a.yaml\n")
-        with self.assertRaisesRegex(ValueError, "cycle"):
-            load_card_config(os.path.join(self.dir, "a.yaml"))
-        with self.assertRaisesRegex(ValueError, "string or a number"):
-            load_card_config(self.write("bad.yaml", "variables: { X: [ 1 ] }\n"))
-        with self.assertRaisesRegex(ValueError, "mapping"):
-            load_card_config(self.write("list.yaml", "- 1\n"))
+        path = self.write(CARD)
+        with self.assertRaisesRegex(ValueError, "no spin 1; it declares 0, 2"):
+            load_card_config(path, "1")
+        for text, message in (
+            ("spins: []\n", "non-empty mapping"),
+            ("spins: { 0: [ 1 ] }\n", "must be a mapping"),
+            ("spins: { 0: { X: [ 1 ] } }\n", "string or a number"),
+            ("spins: { 0: { SPIN: 0 } }\n", "SPIN is the spin itself"),
+            ("- 1\n", "not a mapping"),
+        ):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, message):
+                load_card_config(self.write(text, "bad.yaml"), "0")
 
 
 if __name__ == "__main__":

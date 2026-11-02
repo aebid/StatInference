@@ -1,87 +1,105 @@
-"""Reading a datacard configuration: one card built on another, with variables.
+"""Reading a datacard configuration, and its spin axis.
 
 Every reader of a datacard configuration (dc_make, the law tasks, an analysis's preprocess
 script) goes through `load_card_config`, so a card means the same thing everywhere.
 
-    extends: other.yaml       # optional: the card this one builds on
-    variables:                # optional: ${NAME} is replaced by the value in every string
-      SIGNAL_MODEL: GluGluToRadion
-    ...                       # the card itself
+A configuration may declare the signal hypotheses it is built for as a `spins:` axis, each
+spin naming what differs between them (typically only the signal processes):
 
-- `extends` names another configuration, relative to this file's directory. It is read first
-  (it may extend another one in turn), and this file's keys are merged over it: a mapping is
-  merged key by key, anything else (a list, a string, a number) replaces the base's value, and
-  a key set to null is removed.
-- `variables` are merged like any other mapping (a card can override a variable of its base),
-  then `${NAME}` is substituted in every string of the merged card, keys included. A
-  placeholder that is not a variable (`${MX}`, `${ERA}`, a CombineHarvester `$BIN`) is left as
-  it is, for the tools that fill it later. A variable whose value is not a string or a number
-  is an error, as is a cycle of `extends`.
-- Neither `extends` nor `variables` is part of the returned card.
+    spins:
+      0: { SIGNAL_MODEL: GluGluToRadion, SPIN_NAME: radion }
+      2: { SIGNAL_MODEL: GluGluToBulkGraviton, SPIN_NAME: graviton }
+    processes:
+      - process: ${SIGNAL_MODEL}_bbWW_2L_${MX}
+      ...
+
+The card of a spin is the configuration with that spin's values substituted for `${NAME}` in
+every string, keys included, plus `${SPIN}`, the spin itself. Placeholders that are not spin
+values (`${MX}`, `${ERA}`, CombineHarvester's `$BIN`) are left for the tools that fill them
+later. The chain builds one card per era and spin; a configuration without `spins:` is one
+card per era, as before, and is read unchanged.
 """
 
-import os
 from string import Template
 
 import yaml
 
-_RESERVED = ("extends", "variables")
 
-
-def _merge(base, override):
-    out = dict(base)
-    for key, value in override.items():
-        if value is None:
-            out.pop(key, None)
-        elif isinstance(value, dict) and isinstance(out.get(key), dict):
-            out[key] = _merge(out[key], value)
-        else:
-            out[key] = value
-    return out
-
-
-def _read(path, chain):
-    path = os.path.abspath(path)
-    if path in chain:
-        raise ValueError(
-            "datacard configuration: extends cycle " + " -> ".join(chain + [path])
-        )
+def _read(path):
     with open(path, "r") as f:
         cfg = yaml.safe_load(f) or {}
     if not isinstance(cfg, dict):
         raise ValueError(f"datacard configuration {path}: not a mapping")
-    base = cfg.get("extends")
-    if base is None:
-        return cfg
-    if not isinstance(base, str):
-        raise ValueError(f"datacard configuration {path}: extends must be a file name")
-    parent = _read(os.path.join(os.path.dirname(path), base), chain + [path])
-    return _merge(parent, cfg)
+    return cfg
 
 
-def _substitute(obj, variables):
+def _spin_table(cfg, path):
+    """{spin (str): {name: value (str)}} of a configuration's `spins:`, validated, or None."""
+    spins = cfg.get("spins")
+    if spins is None:
+        return None
+    if not isinstance(spins, dict) or not spins:
+        raise ValueError(
+            f"datacard configuration {path}: spins must be a non-empty mapping "
+            "{spin: {NAME: value}}"
+        )
+    table = {}
+    for spin, values in spins.items():
+        values = values or {}
+        if not isinstance(values, dict):
+            raise ValueError(
+                f"datacard configuration {path}: the values of spin {spin} must be a mapping"
+            )
+        for name, value in values.items():
+            if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+                raise ValueError(
+                    f"datacard configuration {path}: spin {spin}: {name} must be a string "
+                    "or a number"
+                )
+        if "SPIN" in values:
+            raise ValueError(
+                f"datacard configuration {path}: spin {spin}: SPIN is the spin itself and "
+                "is not set in its values"
+            )
+        table[str(spin)] = {name: str(value) for name, value in values.items()}
+    return table
+
+
+def _substitute(obj, values):
     if isinstance(obj, str):
-        return Template(obj).safe_substitute(variables) if "$" in obj else obj
+        return Template(obj).safe_substitute(values) if "$" in obj else obj
     if isinstance(obj, dict):
-        return {
-            _substitute(k, variables): _substitute(v, variables) for k, v in obj.items()
-        }
+        return {_substitute(k, values): _substitute(v, values) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_substitute(v, variables) for v in obj]
+        return [_substitute(v, values) for v in obj]
     return obj
 
 
-def load_card_config(path):
-    """The datacard configuration at `path`, with `extends` merged and `variables` substituted."""
-    cfg = _read(path, [])
-    variables = cfg.get("variables") or {}
-    if not isinstance(variables, dict):
-        raise ValueError(f"datacard configuration {path}: variables must be a mapping")
-    for name, value in variables.items():
-        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
-            raise ValueError(
-                f"datacard configuration {path}: variable {name} must be a string or a number"
-            )
-    variables = {name: str(value) for name, value in variables.items()}
-    cfg = {k: v for k, v in cfg.items() if k not in _RESERVED}
-    return _substitute(cfg, variables) if variables else cfg
+def card_spins(cfg, path="<configuration>"):
+    """The spins of a configuration as strings, in its order, or [None] without `spins:`."""
+    table = _spin_table(cfg, path)
+    return [None] if table is None else list(table)
+
+
+def load_card_config(path, spin=None):
+    """The datacard configuration at `path`.
+
+    With `spin`, the card of that spin: its values substituted and `spins:` removed. Without,
+    the configuration as written, `spins:` included -- what is common to every spin (eras,
+    channels, categories, model, masses) can be read from it, the signal processes not.
+    """
+    cfg = _read(path)
+    table = _spin_table(cfg, path)
+    if spin is None:
+        return cfg
+    if table is None:
+        raise ValueError(
+            f"datacard configuration {path} declares no spins, so there is no spin {spin}"
+        )
+    if str(spin) not in table:
+        raise ValueError(
+            f"datacard configuration {path}: no spin {spin}; it declares "
+            + ", ".join(table)
+        )
+    values = dict(table[str(spin)], SPIN=str(spin))
+    return _substitute({k: v for k, v in cfg.items() if k != "spins"}, values)

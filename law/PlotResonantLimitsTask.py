@@ -51,8 +51,8 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
         return [ResonantLimitsTask.req(self)]
 
     def output(self):
-        # fs_default, like CreateDatacardsTask. Holds one
-        # <era>/ sub-directory of plots plus plots.json naming them.
+        # fs_default, like CreateDatacardsTask. Holds one <era>/ (with `spins:`,
+        # spin<spin>/<era>/) sub-directory of plots plus plots.json naming them.
         return self.output_dir_target(self.version, "LimitPlots")
 
     def _resolve_config_path(self, path):
@@ -100,7 +100,7 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
 
         return params
 
-    def build_plot_spec(self, entry, era, extra_external=()):
+    def build_plot_spec(self, entry, era, extra_external=(), spin=None):
         """PlotMultipleResonantLimits parameters for a ``limit_plots`` entry and era.
 
         Kept as a plain dict so the same values can both construct the task (to learn
@@ -110,7 +110,7 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
         luminosity projections). They come first, so a projection of our own curve is
         drawn before any fixed reference such as the Run 2 result.
         """
-        sequences, names = self.datacard_sequences(entry, era)
+        sequences, names = self.datacard_sequences(entry, era, spin)
         external = tuple(extra_external) + tuple(
             self._resolve_config_path(p) for p in entry.get("external_limits") or []
         )
@@ -123,7 +123,7 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
             **self.common_plot_params(entry, era),
         )
 
-    def build_band_specs(self, entry, era):
+    def build_band_specs(self, entry, era, spin=None):
         """PlotResonantLimits parameters, one per curve, for an entry with ``bands: true``.
 
         The band plot is drawn from a single datacard set, so the multi-curve parameters
@@ -135,7 +135,7 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
         if not entry.get("bands"):
             return []
 
-        sequences, names = self.datacard_sequences(entry, era)
+        sequences, names = self.datacard_sequences(entry, era, spin)
         shared = self.common_plot_params(entry, era)
         known = {param_name for param_name, _ in PlotResonantLimits.get_params()}
 
@@ -155,14 +155,15 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
             specs.append(spec)
         return specs
 
-    def datacard_sequences(self, entry, era):
+    def datacard_sequences(self, entry, era, spin=None):
         """(datacard glob per curve, legend label per curve) for an entry, validated.
 
         Shared by the plot itself and by the luminosity projection, which has to scale the
-        same cards the leading curve is drawn from.
+        same cards the leading curve is drawn from. The globs resolve against the cards of
+        the era and spin.
         """
         name = entry.get("name") or "limits"
-        base_dir = self.datacards_dir(era)
+        base_dir = self.datacards_dir(era, spin)
 
         sequences, names = [], []
         for card in entry["datacards"]:
@@ -268,8 +269,10 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
             f.write("\n")
         return out_path
 
-    def run(self):
-        entries = self.get_config_data().get("limit_plots", [])
+    def spin_entries(self, spin):
+        """The limit_plots entries of a spin's card (of the configuration without spins),
+        validated."""
+        entries = self.get_config_data(spin).get("limit_plots", [])
         if not entries:
             raise RuntimeError(
                 f"{self.datacard_config_path()} declares no 'limit_plots' block, so there "
@@ -288,46 +291,58 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
                 f"names, since the plot file is named after the entry; repeated: "
                 f"{', '.join(duplicates)}. An entry with no 'name' is called 'limits'."
             )
+        return entries
+
+    def run(self):
+        entries_of = {spin: self.spin_entries(spin) for spin in self.card_spins()}
 
         with self.output().localize("w") as local_output:
             produced = []
-            for era in self.get_eras_to_plot():
-                dest_dir = os.path.join(local_output.abspath, era)
-                os.makedirs(dest_dir, exist_ok=True)
+            for spin, entries in entries_of.items():
+                for era in self.get_eras_to_plot():
+                    rel_dir = os.path.join(*self.spin_parts(spin), era)
+                    dest_dir = os.path.join(local_output.abspath, rel_dir)
+                    os.makedirs(dest_dir, exist_ok=True)
+                    label = era if spin is None else f"{era}, spin {spin}"
 
-                for entry in entries:
-                    name = entry.get("name") or "limits"
+                    for entry in entries:
+                        name = entry.get("name") or "limits"
 
-                    # Projections are written into the output directory before the plot
-                    # runs: they are --external-limits inputs, and they are worth keeping
-                    # next to the plot as the record of what was actually drawn.
-                    sequence = self.datacard_sequences(entry, era)[0][0]
-                    projections = [
-                        self.make_lumi_projection(entry, era, proj, sequence, dest_dir)
-                        for proj in entry.get("lumi_projections") or []
-                    ]
+                        # Projections are written into the output directory before the
+                        # plot runs: they are --external-limits inputs, and they are worth
+                        # keeping next to the plot as the record of what was drawn.
+                        sequence = self.datacard_sequences(entry, era, spin)[0][0]
+                        projections = [
+                            self.make_lumi_projection(
+                                entry, era, proj, sequence, dest_dir
+                            )
+                            for proj in entry.get("lumi_projections") or []
+                        ]
 
-                    specs = [
-                        (
-                            PlotMultipleResonantLimits,
-                            self.build_plot_spec(
-                                entry, era, extra_external=projections
-                            ),
-                        )
-                    ]
-                    specs += [
-                        (PlotResonantLimits, s)
-                        for s in self.build_band_specs(entry, era)
-                    ]
+                        specs = [
+                            (
+                                PlotMultipleResonantLimits,
+                                self.build_plot_spec(
+                                    entry, era, extra_external=projections, spin=spin
+                                ),
+                            )
+                        ]
+                        specs += [
+                            (PlotResonantLimits, s)
+                            for s in self.build_band_specs(entry, era, spin)
+                        ]
 
-                    for task_cls, spec in specs:
+                        for task_cls, spec in specs:
+                            produced.extend(
+                                os.path.join(rel_dir, b)
+                                for b in self.draw_plot(
+                                    task_cls, spec, name, label, dest_dir
+                                )
+                            )
                         produced.extend(
-                            os.path.join(era, b)
-                            for b in self.draw_plot(task_cls, spec, name, era, dest_dir)
+                            os.path.join(rel_dir, os.path.basename(p))
+                            for p in projections
                         )
-                    produced.extend(
-                        os.path.join(era, os.path.basename(p)) for p in projections
-                    )
 
             with open(os.path.join(local_output.abspath, "plots.json"), "w") as f:
                 json.dump(sorted(produced), f, indent=2)

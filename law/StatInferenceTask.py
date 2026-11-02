@@ -6,7 +6,7 @@ import shutil
 
 from string import Template
 from FLAF.run_tools.law_customizations import Task, era_csv
-from StatInference.common.card_config import load_card_config
+from StatInference.common.card_config import card_spins, load_card_config
 
 
 class StatInferenceTask(Task):
@@ -76,12 +76,34 @@ class StatInferenceTask(Task):
     def datacard_config_path(self):
         return os.path.join(self.ana_path(), self.statinference_settings()["config"])
 
-    def get_config_data(self):
+    def get_config_data(self, spin=None):
+        """The datacard configuration; with `spin`, the card of that spin.
+
+        Without a spin it is the configuration as written: everything common to the spins
+        (eras, channels, categories, model, masses, campaigns) is read from it, the signal
+        processes and anything else naming the spin are not. See common/card_config.py.
+        """
         # Cached per instance: requires()/workflow_requires() are re-entered many times
         # during graph construction and each call would otherwise re-parse the yaml.
-        if getattr(self, "_config_data", None) is None:
-            self._config_data = load_card_config(self.datacard_config_path())
-        return self._config_data
+        cache = self.__dict__.setdefault("_config_cache", {})
+        if spin not in cache:
+            cache[spin] = load_card_config(self.datacard_config_path(), spin)
+        return cache[spin]
+
+    def card_spins(self):
+        """The spins the configuration declares (`spins:`), or [None] if it declares none:
+        then there is one card per era, and no spin anywhere in the paths."""
+        return card_spins(self.get_config_data(), self.datacard_config_path())
+
+    @staticmethod
+    def spin_parts(spin):
+        """The path component of a spin: ("spin<spin>",), or () for a configuration without
+        spins, whose paths are unchanged."""
+        return () if spin is None else (f"spin{spin}",)
+
+    def cards(self):
+        """[(era, spin)]: every card the configuration builds, eras outer, in their order."""
+        return [(era, spin) for era in self.card_eras() for spin in self.card_spins()]
 
     def store_parts(self):
         """Keyed on the version and the class, not on `--era`.
@@ -97,14 +119,21 @@ class StatInferenceTask(Task):
         """Job logs of a version and class, for the same reason as store_parts()."""
         return self.output_dir_target(self.version, "logs", self.__class__.__name__)
 
-    def datacards_dir(self, era):
-        """Local directory holding an era's datacards.
+    def datacards_dir(self, era, spin=None):
+        """Local directory holding the datacards of an era (and spin).
 
         The cards are produced on fs_default but must be real local files by the time
         combine sees them; ResonantLimitsTask mirrors them here and everything downstream
         (dhi's --multi-datacards globbing, the overlay plots) resolves against this path.
+        A spin's cards are under Datacards/spin<spin>/<era>.
         """
-        return os.path.join(self.ana_data_path(), self.version, "Datacards", era)
+        return os.path.join(
+            self.ana_data_path(),
+            self.version,
+            "Datacards",
+            *self.spin_parts(spin),
+            era,
+        )
 
     def preprocess_config(self):
         """The datacard configuration's `preprocess:` block, or None.

@@ -4,7 +4,7 @@ import os
 
 from CombineHarvester.CombineTools.ch import CombineHarvester
 
-from StatInference.common.card_config import load_card_config
+from StatInference.common.card_config import card_spins, load_card_config
 from StatInference.common.tools import (
     listToVector,
     rebinAndFill,
@@ -39,12 +39,19 @@ class DatacardMaker:
         input_path,
         hist_bins=None,
         param_values=None,
+        spin=None,
         **kwargs,
     ):
         self.cb = CombineHarvester()
 
         self.input_path = input_path
-        cfg = load_card_config(cfg_file)
+        spins = card_spins(load_card_config(cfg_file), cfg_file)
+        if spin is None and spins != [None]:
+            raise ValueError(
+                f"{cfg_file} declares spins ({', '.join(spins)}); say which card to "
+                "build with --spin"
+            )
+        cfg = load_card_config(cfg_file, spin)
         for param in self.customizeble_parameters:
             if param not in kwargs:
                 continue

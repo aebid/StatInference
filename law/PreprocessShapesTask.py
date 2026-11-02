@@ -29,10 +29,20 @@ class PreprocessShapesTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflo
 
     One branch per card of the configuration, in the order of its `eras:`, as
     CreateDatacardsTask, whose branch of a card requires the branch of the same card here.
+    The branch data is the card's era; for a configuration with `spins:` it is
+    {"era": era, "spin": spin}, one branch per era and spin (the step is given --spin, since
+    what it does may follow the signal, as an equal-signal binning does).
     """
 
     max_runtime = copy_param(HTCondorWorkflow.max_runtime, 4.0)
     n_cpus = copy_param(HTCondorWorkflow.n_cpus, 1)
+
+    @staticmethod
+    def card_of(branch_data):
+        """(era, spin) of a branch's data."""
+        if isinstance(branch_data, dict):
+            return branch_data["era"], branch_data["spin"]
+        return branch_data, None
 
     def input_hist_reqs(self, card_eras):
         return {
@@ -48,18 +58,25 @@ class PreprocessShapesTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflo
         # our own inputs drops them, so the jobs start without the bundle they need.
         reqs = super().stage_workflow_requires()
         # the selected cards only (the map honours --branches)
-        reqs.update(self.input_hist_reqs(self.get_branch_map().values()))
+        eras = dict.fromkeys(
+            self.card_of(data)[0] for data in self.get_branch_map().values()
+        )
+        reqs.update(self.input_hist_reqs(list(eras)))
         return reqs
 
     def requires(self):
-        return list(self.input_hist_reqs([self.branch_data]).values())
+        return list(self.input_hist_reqs([self.card_of(self.branch_data)[0]]).values())
 
     def create_branch_map(self):
-        return dict(enumerate(self.card_eras()))
+        cards = self.cards()
+        if self.card_spins() == [None]:
+            return dict(enumerate(era for era, _ in cards))
+        return dict(enumerate({"era": era, "spin": spin} for era, spin in cards))
 
     def output(self):
+        era, spin = self.card_of(self.branch_data)
         return self.output_dir_target(
-            self.version, "Hists_preprocessed", self.branch_data
+            self.version, "Hists_preprocessed", era, *self.spin_parts(spin)
         )
 
     def run(self):
@@ -71,7 +88,7 @@ class PreprocessShapesTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflo
                 "directly in that case and does not require it."
             )
         script = os.path.join(self.ana_path(), cfg["script"])
-        card_era = self.branch_data
+        card_era, spin = self.card_of(self.branch_data)
         with contextlib.ExitStack() as stack:
             targets = {
                 key: req.output()
@@ -95,12 +112,18 @@ class PreprocessShapesTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflo
                 "--config",
                 self.datacard_config_path(),
             ]
+            if spin is not None:
+                cmd += ["--spin", spin]
             # ${ERA} in an argument names the era being produced, the same way the model's
-            # input_file_pattern does. An argument beginning with "config/" is resolved
-            # against the analysis area, so a configuration can point at its own files
-            # without absolute paths; every other argument is passed through untouched.
+            # input_file_pattern does (and ${SPIN} the spin). An argument beginning with
+            # "config/" is resolved against the analysis area, so a configuration can point
+            # at its own files without absolute paths; every other argument is passed
+            # through untouched.
+            names = (
+                {"ERA": card_era} if spin is None else {"ERA": card_era, "SPIN": spin}
+            )
             for arg in cfg.get("args", []):
-                arg = Template(str(arg)).safe_substitute(ERA=card_era)
+                arg = Template(str(arg)).safe_substitute(names)
                 if arg.startswith("config/"):
                     arg = os.path.join(self.ana_path(), arg)
                 cmd.append(arg)

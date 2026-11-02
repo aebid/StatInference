@@ -31,6 +31,9 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
     The mass points share nothing, so each is its own branch: built together, one maker
     holding every mass slows with each uncertainty added (25 masses of a 27-bin card took
     ~5 h), while a branch per mass takes minutes and runs in parallel.
+
+    A configuration with `spins:` has a card per era and spin: branch data
+    {"era": era, "spin": spin, "mass": value}, the card built with --spin.
     """
 
     max_runtime = copy_param(HTCondorWorkflow.max_runtime, 2.0)
@@ -41,8 +44,9 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
     # merged shape (and hence each datacard bin) is built from.
     make_plots = luigi.BoolParameter(default=True)
 
-    def input_hist_reqs(self, card_eras, masses, branch=True):
-        """{key: task} for the shapes the cards of `card_eras` at `masses` are built from.
+    def input_hist_reqs(self, card_eras, masses, branch=True, spins=None):
+        """{key: task} for the shapes the cards of `card_eras` (and `spins`, every spin of
+        the configuration if None) at `masses` are built from.
 
         The configuration's `preprocess:` step if it declares one -- the branches of those
         cards (PreprocessShapesTask has one per card), as a workflow, or a single branch
@@ -51,8 +55,11 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
         "<era>/<variable>/<variable>.root", so nothing below here knows which it got.
         """
         if self.preprocess_config():
-            cards = self.card_eras()
-            indices = sorted({cards.index(era) for era in card_eras})
+            cards = self.cards()
+            spins = self.card_spins() if spins is None else spins
+            indices = sorted(
+                {cards.index((era, spin)) for era in card_eras for spin in spins}
+            )
             if branch and len(indices) == 1:
                 req = PreprocessShapesTask.req(self, branch=indices[0])
             else:
@@ -88,12 +95,17 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
         selected = self.get_branch_map().values()
         card_eras = {data["era"] for data in selected}
         masses = {data["mass"] for data in selected}
-        reqs.update(self.input_hist_reqs(card_eras, masses, branch=False))
+        spins = {data.get("spin") for data in selected}
+        reqs.update(self.input_hist_reqs(card_eras, masses, branch=False, spins=spins))
         return reqs
 
     def requires(self):
         data = self.branch_data
-        return list(self.input_hist_reqs([data["era"]], [data["mass"]]).values())
+        return list(
+            self.input_hist_reqs(
+                [data["era"]], [data["mass"]], spins=[data.get("spin")]
+            ).values()
+        )
 
     def card_masses(self):
         """The mass points the cards are built for: global.yaml's StatInference
@@ -105,10 +117,15 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
 
     def create_branch_map(self):
         masses = self.card_masses()
+        with_spin = self.card_spins() != [None]
         return dict(
             enumerate(
-                {"era": era, "mass": mass}
-                for era in self.card_eras()
+                (
+                    {"era": era, "spin": spin, "mass": mass}
+                    if with_spin
+                    else {"era": era, "mass": mass}
+                )
+                for era, spin in self.cards()
                 for mass in masses
             )
         )
@@ -122,11 +139,13 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
             self.version,
             "Datacards",
             self.branch_data["era"],
+            *self.spin_parts(self.branch_data.get("spin")),
             f"{param}_{self.branch_data['mass']}",
         )
 
     def run(self):
         card_era, mass = self.branch_data["era"], self.branch_data["mass"]
+        spin = self.branch_data.get("spin")
         statInf_entry = self.statinference_settings()
         config = self.datacard_config_path()
         # ${ERA} in hist_bins names the era the cards are for, the same way the model's
@@ -149,7 +168,9 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
                 # PreprocessShapesTask already wrote the "<era>/<variable>/<variable>.root"
                 # layout, so its output directory is the base input_file_pattern resolves
                 # against -- nothing to stage.
-                reqs = self.input_hist_reqs([card_era], [mass])["PreprocessShapes"]
+                reqs = self.input_hist_reqs([card_era], [mass], spins=[spin])[
+                    "PreprocessShapes"
+                ]
                 base_dir_local = stack.enter_context(reqs.output().localize("r"))
             else:
                 targets = {
@@ -176,6 +197,8 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
             if hist_bins:
                 cmd += ["--hist-bins", hist_bins]
             cmd += ["--param_values", str(self.branch_data["mass"])]
+            if spin is not None:
+                cmd += ["--spin", spin]
             ps_call(cmd, env=self.cmssw_env, verbose=1)
 
             if self.make_plots:

@@ -3,10 +3,10 @@ import law
 import luigi
 import os
 import shutil
-import yaml
 
 from string import Template
 from FLAF.run_tools.law_customizations import Task, era_csv
+from StatInference.common.card_config import load_card_config
 
 
 class StatInferenceTask(Task):
@@ -80,8 +80,7 @@ class StatInferenceTask(Task):
         # Cached per instance: requires()/workflow_requires() are re-entered many times
         # during graph construction and each call would otherwise re-parse the yaml.
         if getattr(self, "_config_data", None) is None:
-            with open(self.datacard_config_path(), "r") as f:
-                self._config_data = yaml.safe_load(f)
+            self._config_data = load_card_config(self.datacard_config_path())
         return self._config_data
 
     def store_parts(self):

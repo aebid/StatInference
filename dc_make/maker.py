@@ -1,10 +1,10 @@
 import itertools
 import math
 import os
-import yaml
 
 from CombineHarvester.CombineTools.ch import CombineHarvester
 
+from StatInference.common.card_config import load_card_config
 from StatInference.common.tools import (
     listToVector,
     rebinAndFill,
@@ -44,8 +44,7 @@ class DatacardMaker:
         self.cb = CombineHarvester()
 
         self.input_path = input_path
-        with open(cfg_file, "r") as f:
-            cfg = yaml.safe_load(f)
+        cfg = load_card_config(cfg_file)
         for param in self.customizeble_parameters:
             if param not in kwargs:
                 continue

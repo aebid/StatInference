@@ -425,7 +425,9 @@ class PlainChainTest(ChainTestCase):
         self.write_merged_hists()
         for (card_era, mass), card in cards_of(limits_task()).items():
             with self.subTest(card=card_era, mass=mass):
-                card = fx.si.CreateDatacardsTask.req(card, make_plots=False)
+                card = fx.si.CreateDatacardsTask.req(
+                    card, make_plots=False, _skip_task_excludes=True
+                )
                 calls = self.run_payload(card, create_datacards_module)
                 self.assertEqual(
                     [c[0][1] for c in calls],

@@ -32,9 +32,14 @@ class ResonantLimitsTask(StatInferenceTask):
         return CreateDatacardsTask.req(self, branches=())
 
     def era_card_outputs(self):
-        """{card era: [the outputs of the branches that write that card's masses]}."""
+        """{card era: [the outputs of the branches that write that card's masses]}, each
+        era's in increasing mass, so staging them is deterministic."""
         outputs = {}
-        for task in self.requires().get_branch_tasks().values():
+        tasks = sorted(
+            self.requires().get_branch_tasks().values(),
+            key=lambda task: float(task.branch_data["mass"]),
+        )
+        for task in tasks:
             outputs.setdefault(task.branch_data["era"], []).append(task.output())
         return outputs
 
@@ -55,7 +60,10 @@ class ResonantLimitsTask(StatInferenceTask):
 
         CreateDatacardsTask writes each mass to its own directory; they are merged here
         into the one directory per era that the limits and the plots glob, laid out as when
-        one task wrote every mass (the file names carry the mass, so nothing collides).
+        one task wrote every mass. The datacard and shape file names carry the mass, so two
+        masses writing the same path is a bug, and it raises rather than one card silently
+        replacing the other. The shape plots are named by variable, which several masses
+        may share, so each mass's plots/ is mirrored to plots/<its directory>/.
 
         CreateDatacardsTask writes to fs_default, but the cards must be real local files
         by the time combine sees them: MergeResonantLimits shells out to combine, and
@@ -80,10 +88,35 @@ class ResonantLimitsTask(StatInferenceTask):
             part.touch()
             try:
                 remote_target.copy_to_local(part)
-                shutil.copytree(part.abspath, local_dir, dirs_exist_ok=True)
+                self._merge_mass_dir(
+                    part.abspath,
+                    local_dir,
+                    os.path.basename(remote_target.path.rstrip("/")),
+                )
             finally:
                 part.remove(silent=True)
         return local_dir
+
+    @staticmethod
+    def _merge_mass_dir(src, dest, mass_dir):
+        """Copy one mass's output `src` into the era's `dest`: plots/ to plots/<mass_dir>/,
+        everything else to the same relative path, raising if that path already exists.
+        """
+        for root, _, files in os.walk(src):
+            rel = os.path.relpath(root, src)
+            parts = [] if rel == "." else rel.split(os.sep)
+            if parts[:1] == ["plots"]:
+                parts = ["plots", mass_dir] + parts[1:]
+            target_dir = os.path.join(dest, *parts)
+            os.makedirs(target_dir, exist_ok=True)
+            for name in files:
+                target = os.path.join(target_dir, name)
+                if os.path.lexists(target):
+                    raise RuntimeError(
+                        f"staging {mass_dir} into {dest}: {os.path.join(*parts, name)} "
+                        "was already written by another mass point"
+                    )
+                shutil.copy2(os.path.join(root, name), target)
 
     def run(self):
         era_cards = {}

@@ -545,5 +545,61 @@ class PreprocessChainTest(ChainTestCase):
                 self.assertEqual(files, {os.path.join(card_era, "marker.root")})
 
 
+class StageMassDirTest(unittest.TestCase):
+    """ResonantLimitsTask._merge_mass_dir: how one mass's output joins its era's mirror."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.dest = os.path.join(self.tmp, "era")
+        self.merge = limits_module.ResonantLimitsTask._merge_mass_dir
+
+    def mass_dir(self, mass, files):
+        src = os.path.join(self.tmp, f"src_{mass}")
+        for rel in files:
+            path = os.path.join(src, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(f"{mass}\n")
+        return src
+
+    def tree(self):
+        return {
+            os.path.relpath(os.path.join(root, name), self.dest)
+            for root, _, files in os.walk(self.dest)
+            for name in files
+        }
+
+    def test_masses_side_by_side_and_plots_per_mass(self):
+        for mass in (300, 1000):
+            src = self.mass_dir(
+                mass,
+                [
+                    f"datacard_{mass}.txt",
+                    f"era/eE/datacard_{mass}.txt",
+                    "plots/DNN_eE_SR_res2b.pdf",
+                ],
+            )
+            self.merge(src, self.dest, f"MX_{mass}")
+        self.assertEqual(
+            self.tree(),
+            {
+                "datacard_300.txt",
+                "datacard_1000.txt",
+                "era/eE/datacard_300.txt",
+                "era/eE/datacard_1000.txt",
+                "plots/MX_300/DNN_eE_SR_res2b.pdf",
+                "plots/MX_1000/DNN_eE_SR_res2b.pdf",
+            },
+        )
+
+    def test_a_path_written_by_two_masses_raises(self):
+        self.merge(self.mass_dir(300, ["shapes.root"]), self.dest, "MX_300")
+        with self.assertRaisesRegex(RuntimeError, "shapes.root.*another mass point"):
+            self.merge(self.mass_dir(1000, ["shapes.root"]), self.dest, "MX_1000")
+        with open(os.path.join(self.dest, "shapes.root")) as f:
+            self.assertEqual(f.read(), "300\n")
+
+
 if __name__ == "__main__":
     unittest.main()

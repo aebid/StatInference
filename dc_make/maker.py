@@ -21,7 +21,6 @@ from .uncertainty import (
     UncertaintyScale,
     MultiValueLnNUncertainty,
     LnNUncertainty,
-    RateParamUncertainty,
     ShapeUncertainty,
 )
 from .model import Model
@@ -1142,19 +1141,6 @@ class DatacardMaker:
                     continue
 
             if (
-                isinstance(unc, RateParamUncertainty)
-                and unc.eras
-                and self.isMetaEra(era)
-                and not all(
-                    Uncertainty.hasMatch(e, unc.eras) for e in self.getSubEras(era)
-                )
-            ):
-                # a rateParam scales the whole bin: it cannot act on one sub-era's part
-                raise RuntimeError(
-                    f"rateParam {unc_name}: eras {unc.eras} select only part of the "
-                    f"meta-era {era}, whose bins sum all of {self.getSubEras(era)}"
-                )
-            if (
                 self.isMetaEra(era)
                 and isinstance(unc, (LnNUncertainty, MultiValueLnNUncertainty))
                 and self.lnNIsEraDependent(unc)
@@ -1339,8 +1325,6 @@ class DatacardMaker:
                         self.cbCopy(
                             param_str, proc_name, era, channel, category
                         ).syst_name([unc_name]).ForEachSyst(setShape)
-
-        unc.configureParameters(self.cb, unc_name)
 
     def writeDatacards(self, output):
         os.makedirs(output, exist_ok=True)

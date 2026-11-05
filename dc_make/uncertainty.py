@@ -19,7 +19,6 @@ class UncertaintyType(Enum):
     auto = 0
     lnN = 1
     shape = 2
-    rateParam = 3
 
 
 class Uncertainty:
@@ -38,10 +37,6 @@ class Uncertainty:
         self.channels = channels
         self.categories = categories
         self.hasMultipleValues = hasMultipleValues
-
-    def configureParameters(self, cb, name):
-        """Set what the card needs on the parameter(s) once the uncertainty is in it."""
-        pass
 
     def appliesTo(self, process, era, channel, category):
         match_subprocess = (
@@ -163,27 +158,6 @@ class Uncertainty:
                 raise RuntimeError("Invalid lnN uncertainty value")
         elif unc_type == UncertaintyType.shape:
             unc = ShapeUncertainty(name, **args)
-        elif unc_type == UncertaintyType.rateParam:
-            unexpected = set(entry) - {
-                "name",
-                "type",
-                "value",
-                "range",
-                "processes",
-                "eras",
-                "channels",
-                "categories",
-            }
-            if unexpected:
-                raise RuntimeError(
-                    f"rateParam {name}: unsupported keys {sorted(unexpected)}"
-                )
-            unc = RateParamUncertainty(
-                name,
-                value=entry.get("value", 1.0),
-                value_range=entry.get("range"),
-                **args,
-            )
         elif unc_type == UncertaintyType.auto:
             unc = AutoUncertainty(name, **args)
         else:
@@ -363,65 +337,6 @@ class ShapeUncertainty(Uncertainty):
 
     def valueToMap(self, digits=3):
         return SystMap()(1.0)
-
-
-class RateParamUncertainty(Uncertainty):
-    """A freely floating normalisation (combine `rateParam`): one parameter that scales every
-    process and bin it applies to, starting at `value` and allowed within `value_range`. The same
-    name in several bins is one parameter, which is how a control region constrains the signal
-    region: scope it with `processes` and `categories` to the bins it should tie together.
-    """
-
-    default_range = (0.0, 10.0)
-
-    def __init__(self, name, value=1.0, value_range=None, **kwargs):
-        super().__init__(name, **kwargs)
-        if "$" in name:
-            # CombineHarvester would substitute the placeholder per bin, giving one
-            # parameter per bin where the range below could not be found
-            raise RuntimeError(
-                f"rateParam {name}: placeholders ($...) are not supported"
-            )
-        if value_range is None:
-            value_range = self.default_range
-        try:
-            self.value = float(value)
-            self.value_range = [float(v) for v in value_range]
-        except (TypeError, ValueError):
-            raise RuntimeError(
-                f"rateParam {name}: value {value!r} and range {value_range!r} must be "
-                "numbers"
-            )
-        low, high = (self.value_range + [None, None])[:2]
-        if (
-            len(self.value_range) != 2
-            or not low < high
-            or not low <= self.value <= high
-        ):
-            raise RuntimeError(
-                f"rateParam {name}: range {self.value_range} must be [low, high] and "
-                f"contain the initial value {self.value}"
-            )
-
-    @property
-    def type(self):
-        return UncertaintyType.rateParam
-
-    @property
-    def needShapes(self):
-        return False
-
-    def canIgnore(self, value_thr):
-        return False
-
-    def valueToMap(self, digits=3):
-        return SystMap()(self.value)
-
-    def configureParameters(self, cb, name):
-        # one parameter for every bin and process it was added to; the range is its own
-        param = cb.GetParameter(name)
-        if param:  # absent when the uncertainty matched no bin of this card
-            param.set_range(*self.value_range)
 
 
 class AutoUncertainty(Uncertainty):

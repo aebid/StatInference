@@ -58,21 +58,21 @@ class PlotPullsAndImpactsTask(DhiPlotMixin, StatInferenceTask):
         """
         return self.get_all_eras() if entry.get("glob") else ["combined"]
 
-    def card_for(self, entry, era, mass, spin=None):
+    def card_for(self, entry, era, mass):
         """The single datacard an entry's plot is built from.
 
         PullsAndImpacts fits one card, not a glob -- every parameter gets its own
         combine job against that one workspace -- so an entry's `glob:` and mass have to
-        resolve to exactly one file. Looked up among the cards of `spin`.
+        resolve to exactly one file.
         """
         name = entry.get("name") or "impacts"
         pattern = entry.get("glob")
         if not pattern:
             # The combined card ResonantLimitsTask writes: one per mass, every era in it.
-            base = self.datacards_dir("combined", spin)
+            base = self.datacards_dir("combined")
             candidates = glob.glob(os.path.join(base, "combined_*.txt"))
         else:
-            base = self.datacards_dir(era, spin)
+            base = self.datacards_dir(era)
             candidates = glob.glob(
                 os.path.join(base, Template(pattern).safe_substitute(ERA=era))
             )
@@ -93,7 +93,7 @@ class PlotPullsAndImpactsTask(DhiPlotMixin, StatInferenceTask):
             )
         return matched[0]
 
-    def card_family(self, entry, era, spin=None):
+    def card_family(self, entry, era):
         """The datacard set an entry's card belongs to, as a MergeResonantLimits glob.
 
         The limit is merged over a family of per-mass cards, so the family is what has to
@@ -104,8 +104,7 @@ class PlotPullsAndImpactsTask(DhiPlotMixin, StatInferenceTask):
         if pattern:
             return (
                 os.path.join(
-                    self.datacards_dir(era, spin),
-                    Template(pattern).safe_substitute(ERA=era),
+                    self.datacards_dir(era), Template(pattern).safe_substitute(ERA=era)
                 ),
             )
 
@@ -121,9 +120,9 @@ class PlotPullsAndImpactsTask(DhiPlotMixin, StatInferenceTask):
                 f"limit from, but the configuration has {eras}. Give the entry a number "
                 "instead."
             )
-        return (os.path.join(self.datacards_dir(eras[0], spin), "*.txt"),)
+        return (os.path.join(self.datacards_dir(eras[0]), "*.txt"),)
 
-    def expected_limit(self, entry, era, mass, spin=None):
+    def expected_limit(self, entry, era, mass):
         """The expected limit on r at a mass, from the limits already computed for it.
 
         The path comes from dhi's own task rather than being assembled here: the store
@@ -133,7 +132,7 @@ class PlotPullsAndImpactsTask(DhiPlotMixin, StatInferenceTask):
         """
         import numpy as np
 
-        sequence = self.card_family(entry, era, spin)
+        sequence = self.card_family(entry, era)
         target = MergeResonantLimits(
             version=self.version, datacards=tuple(sequence)
         ).output()
@@ -168,7 +167,7 @@ class PlotPullsAndImpactsTask(DhiPlotMixin, StatInferenceTask):
     # The parameter the ranking is of. dhi's own default for a resonant search.
     poi_name = "r"
 
-    def poi_value(self, entry, era, mass, spin=None):
+    def poi_value(self, entry, era, mass):
         """The value of r the Asimov dataset is built at, or None to leave dhi's default.
 
         This matters more than it looks. dhi builds the Asimov at r=1 unless told
@@ -197,10 +196,10 @@ class PlotPullsAndImpactsTask(DhiPlotMixin, StatInferenceTask):
         if value is None:
             return None
         if value == "limit":
-            return self.expected_limit(entry, era, mass, spin)
+            return self.expected_limit(entry, era, mass)
         return float(value)
 
-    def build_plot_spec(self, entry, era, mass, spin=None):
+    def build_plot_spec(self, entry, era, mass):
         """PlotPullsAndImpacts parameters for an entry and mass point.
 
         Kept as a plain dict so the same values can both construct the task (to learn
@@ -227,7 +226,7 @@ class PlotPullsAndImpactsTask(DhiPlotMixin, StatInferenceTask):
 
         return dict(
             version=self.version,
-            datacards=(self.card_for(entry, era, mass, spin),),
+            datacards=(self.card_for(entry, era, mass),),
             mass=float(mass),
             # PullsAndImpacts is a plain POITask, so hh_model defaults to the
             # non-resonant model_default -- which would fit r together with kl, kt, CV and
@@ -240,7 +239,7 @@ class PlotPullsAndImpactsTask(DhiPlotMixin, StatInferenceTask):
             **{"hh_model": law.NO_STR, **plot_params},
         )
 
-    def report_dropped_parameters(self, entry, era, mass, spec, spin=None):
+    def report_dropped_parameters(self, entry, era, mass, spec):
         """Warn about nuisances robustHesse removed from the fit.
 
         robustHesse drops a parameter it cannot invert, logs "Dropping <name> from the
@@ -262,7 +261,7 @@ class PlotPullsAndImpactsTask(DhiPlotMixin, StatInferenceTask):
             fitted = {p["name"] for p in json.load(f).get("params", [])}
 
         card_params = set()
-        with open(self.card_for(entry, era, mass, spin)) as f:
+        with open(self.card_for(entry, era, mass)) as f:
             for line in f:
                 parts = line.split()
                 if len(parts) >= 2 and parts[1] in ("shape", "lnN"):
@@ -281,59 +280,55 @@ class PlotPullsAndImpactsTask(DhiPlotMixin, StatInferenceTask):
             )
 
     def run(self):
-        entries_of = {}
-        for spin in self.card_spins():
-            entries_of[spin] = self.get_config_data(spin).get("impact_plots", [])
-            if not entries_of[spin]:
-                raise RuntimeError(
-                    f"{self.datacard_config_path()} declares no 'impact_plots' block, so "
-                    "there is nothing to plot."
-                )
+        entries = self.get_config_data().get("impact_plots", [])
+        if not entries:
+            raise RuntimeError(
+                f"{self.datacard_config_path()} declares no 'impact_plots' block, so "
+                "there is nothing to plot."
+            )
 
         with self.output().localize("w") as local_output:
             produced = []
-            for spin, entries in entries_of.items():
-                for entry in entries:
-                    produced += self.draw_entry(entry, spin, local_output.abspath)
+            for entry in entries:
+                name = entry.get("name") or "impacts"
+                masses = entry.get("masses")
+                if not masses:
+                    raise RuntimeError(
+                        f"impact_plots entry '{name}': no 'masses'. Each one costs about "
+                        "two combine fits per nuisance, so they are listed explicitly "
+                        "rather than defaulting to every mass in the model."
+                    )
+
+                for era in self.entry_eras(entry):
+                    for mass in masses:
+                        rel = os.path.join(name, era, str(mass))
+                        dest_dir = os.path.join(local_output.abspath, rel)
+                        os.makedirs(dest_dir, exist_ok=True)
+
+                        spec = self.build_plot_spec(entry, era, mass)
+                        extra = list(entry.get("dhi_args") or ())
+                        # Everything that has to reach combine itself goes through
+                        # PullsAndImpacts' custom_args, which is a single string, so the
+                        # signal strength and any fit options are joined into one.
+                        custom = []
+                        poi = self.poi_value(entry, era, mass)
+                        if poi is not None:
+                            custom.append(f"--expectSignal={poi:.4g}")
+                        custom += [str(a) for a in (entry.get("fit_args") or ())]
+                        if custom:
+                            extra.append(
+                                "--PullsAndImpacts-custom-args=" + " ".join(custom)
+                            )
+                        basenames = self.draw_plot(
+                            PlotPullsAndImpacts,
+                            spec,
+                            name,
+                            f"{era} mass {mass}",
+                            dest_dir,
+                            extra_args=extra,
+                        )
+                        self.report_dropped_parameters(entry, era, mass, spec)
+                        produced.extend(os.path.join(rel, b) for b in basenames)
 
             with open(os.path.join(local_output.abspath, "impacts.json"), "w") as f:
                 json.dump(sorted(produced), f, indent=2)
-
-    def draw_entry(self, entry, spin, out_dir):
-        """The plots of one impact_plots entry of a spin's card, under
-        <name>/[spin<spin>/]<era>/<mass> of `out_dir`; returns their relative paths."""
-        name = entry.get("name") or "impacts"
-        masses = entry.get("masses")
-        if not masses:
-            raise RuntimeError(
-                f"impact_plots entry '{name}': no 'masses'. Each one costs about "
-                "two combine fits per nuisance, so they are listed explicitly "
-                "rather than defaulting to every mass in the model."
-            )
-
-        produced = []
-        for era in self.entry_eras(entry):
-            for mass in masses:
-                rel = os.path.join(name, *self.spin_parts(spin), era, str(mass))
-                dest_dir = os.path.join(out_dir, rel)
-                os.makedirs(dest_dir, exist_ok=True)
-
-                spec = self.build_plot_spec(entry, era, mass, spin)
-                extra = list(entry.get("dhi_args") or ())
-                # Everything that has to reach combine itself goes through
-                # PullsAndImpacts' custom_args, which is a single string, so the
-                # signal strength and any fit options are joined into one.
-                custom = []
-                poi = self.poi_value(entry, era, mass, spin)
-                if poi is not None:
-                    custom.append(f"--expectSignal={poi:.4g}")
-                custom += [str(a) for a in (entry.get("fit_args") or ())]
-                if custom:
-                    extra.append("--PullsAndImpacts-custom-args=" + " ".join(custom))
-                label = f"{era} mass {mass}" + ("" if spin is None else f" spin {spin}")
-                basenames = self.draw_plot(
-                    PlotPullsAndImpacts, spec, name, label, dest_dir, extra_args=extra
-                )
-                self.report_dropped_parameters(entry, era, mass, spec, spin)
-                produced.extend(os.path.join(rel, b) for b in basenames)
-        return produced

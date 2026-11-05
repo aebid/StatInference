@@ -32,46 +32,25 @@ class ResonantLimitsTask(StatInferenceTask):
         return CreateDatacardsTask.req(self, branches=())
 
     def era_card_outputs(self):
-        """{card era: [the outputs of the branches that write that card's masses]}; for a
-        configuration with `spins:`, keyed (card era, spin)."""
+        """{card era: [the outputs of the branches that write that card's masses]}."""
         outputs = {}
         for task in self.requires().get_branch_tasks().values():
-            key = self.card_key(task.branch_data["era"], task.branch_data.get("spin"))
-            outputs.setdefault(key, []).append(task.output())
+            outputs.setdefault(task.branch_data["era"], []).append(task.output())
         return outputs
 
-    @staticmethod
-    def card_key(era, spin):
-        return era if spin is None else (era, spin)
-
-    @staticmethod
-    def merge_key(spin, key):
-        return key if spin is None else f"spin{spin}|{key}"
-
-    def spin_output(self, spin):
-        parts = self.spin_parts(spin)
+    def output(self):
         return {
             # The limit of the combination this configuration is about: the single
             # top-level era's own, or the cross-era combined cards' when it lists
             # several. See run() on why this is not one merge over every listed era.
-            "limits": self.local_target(*parts, "limits.npz"),
+            "limits": self.local_target("limits.npz"),
             # One limits_<era>.npz per era in `eras:`, which is what get_all_eras()
             # promises -- each era its own datacards and its own limit.
-            "era_limits": law.LocalDirectoryTarget(
-                self.local_path(*parts, "era_limits")
-            ),
-            "datacards": law.LocalDirectoryTarget(self.datacards_dir("combined", spin)),
+            "era_limits": law.LocalDirectoryTarget(self.local_path("era_limits")),
+            "datacards": law.LocalDirectoryTarget(self.datacards_dir("combined")),
         }
 
-    def output(self):
-        """The outputs of run(); for a configuration with `spins:`, one such set per spin,
-        {"spin<spin>": {...}}, each spin its own limits."""
-        spins = self.card_spins()
-        if spins == [None]:
-            return self.spin_output(None)
-        return {f"spin{spin}": self.spin_output(spin) for spin in spins}
-
-    def stage_datacards(self, era, remote_targets, spin=None):
+    def stage_datacards(self, era, remote_targets):
         """Mirror an era's datacards from fs_default to a stable local path, returned.
 
         CreateDatacardsTask writes each mass to its own directory; they are merged here
@@ -87,7 +66,7 @@ class ResonantLimitsTask(StatInferenceTask):
         The mirror path is the one CreateDatacardsTask used to write to directly, so
         existing --multi-datacards invocations keep working unchanged.
         """
-        local_dir = self.datacards_dir(era, spin)
+        local_dir = self.datacards_dir(era)
         local_target = law.LocalDirectoryTarget(local_dir)
         # Re-staged on every run, including the re-entry after the yield below. The
         # copy is small (~30 MB) and unconditional refresh is what keeps the mirror
@@ -107,38 +86,10 @@ class ResonantLimitsTask(StatInferenceTask):
         return local_dir
 
     def run(self):
-        # Each spin is its own measurement, with its own cards, merges and outputs; they
-        # are only prepared in turn here, and all merges are yielded at once below.
-        merges, prepared = {}, {}
-        card_outputs = self.era_card_outputs()
-        for spin in self.card_spins():
-            era_cards, combining = self.prepare_spin(spin, card_outputs)
-            prepared[spin] = (era_cards, combining)
-            for key, merge in self.spin_merges(era_cards, combining, spin).items():
-                merges[self.merge_key(spin, key)] = merge
-        merged = yield merges
-
-        for spin, (era_cards, combining) in prepared.items():
-            keys = list(era_cards) + [COMBINED_KEY]
-            spin_merged = {
-                key: merged[self.merge_key(spin, key)]
-                for key in keys
-                if self.merge_key(spin, key) in merged
-            }
-            self.write_spin_limits(spin, era_cards, combining, spin_merged)
-
-    def prepare_spin(self, spin, card_outputs):
-        """Stage a spin's cards per era and write its cross-era combined cards.
-
-        Returns ({era: [datacard]}, the cross-era combined cards if that combination is a
-        fit of its own, else ()).
-        """
         era_cards = {}
-        for key, card_output in card_outputs.items():
-            e, s = (key, None) if spin is None else key
-            if s != spin:
-                continue
-            output_dir = self.stage_datacards(e, card_output, spin)
+
+        for e, card_output in self.era_card_outputs().items():
+            output_dir = self.stage_datacards(e, card_output)
             era_cards[e] = glob.glob(os.path.join(output_dir, "*.txt"))
 
         masses = set()
@@ -172,7 +123,7 @@ class ResonantLimitsTask(StatInferenceTask):
                     with open(out_file, "w") as f:
                         subprocess.run(cmd, env=self.cmssw_env, stdout=f, check=True)
 
-            out_dc_dir = self.spin_output(spin)["datacards"]
+            out_dc_dir = self.output()["datacards"]
             if out_dc_dir.exists():
                 out_dc_dir.remove()
             out_dc_dir.touch()
@@ -182,41 +133,29 @@ class ResonantLimitsTask(StatInferenceTask):
                 shutil.copy2(os.path.join(staging, name), dest)
                 combined_cards.append(dest)
 
-        # The cross-era combination is only a separate fit when there is more than one
-        # era to combine; with a single top-level era that era's own merge already is it.
-        combining = (
-            tuple(sorted(combined_cards))
-            if len(self.get_top_level_eras()) > 1 and combined_cards
-            else ()
-        )
-        return era_cards, combining
-
-    def spin_merges(self, era_cards, combining, spin):
-        """{era or COMBINED_KEY: MergeResonantLimits} of a spin.
-
-        One merge per era, never one merge over every era's cards together. dhi groups
-        the datacards it is given by the mass in their file name alone and runs
-        combineCards over each group, so a single merge handed five eras' cards fits
-        all five into one workspace per mass. With a configuration listing a group era
-        *and* its members -- x_hh_bbww_DL_run3_1D.yaml does -- that counted every
-        2022-2023BPix event twice, and the result was one over-strong limit per mass
-        rather than the per-era limits get_all_eras() describes.
-        """
+        # One merge per era, never one merge over every era's cards together. dhi groups
+        # the datacards it is given by the mass in their file name alone and runs
+        # combineCards over each group, so a single merge handed five eras' cards fits
+        # all five into one workspace per mass. With a configuration listing a group era
+        # *and* its members -- x_hh_bbww_DL_run3_1D.yaml does -- that counted every
+        # 2022-2023BPix event twice, and the result was one over-strong limit per mass
+        # rather than the per-era limits get_all_eras() describes.
         merges = {
             e: MergeResonantLimits(version=self.version, datacards=tuple(cards))
             for e, cards in era_cards.items()
             if cards
         }
+        top_level = self.get_top_level_eras()
+        # The cross-era combination is only a separate fit when there is more than one
+        # era to combine; with a single top-level era that era's own merge already is it.
+        combining = len(top_level) > 1 and combined_cards
         if combining:
             merges[COMBINED_KEY] = MergeResonantLimits(
-                version=self.version, datacards=combining
+                version=self.version, datacards=tuple(sorted(combined_cards))
             )
-        return merges
+        merged = yield merges
 
-    def write_spin_limits(self, spin, era_cards, combining, merged):
-        """Copy a spin's merged limits into its outputs."""
-        top_level = self.get_top_level_eras()
-        era_dir = self.spin_output(spin)["era_limits"]
+        era_dir = self.output()["era_limits"]
         if era_dir.exists():
             era_dir.remove()
         era_dir.touch()
@@ -228,11 +167,9 @@ class ResonantLimitsTask(StatInferenceTask):
 
         headline = merged[COMBINED_KEY] if combining else merged.get(top_level[0])
         if headline is None:
-            which = "" if spin is None else f" of spin {spin}"
             raise RuntimeError(
-                f"No datacards{which} were found for any top-level era "
+                "No datacards were found for any top-level era "
                 f"({', '.join(top_level)}), so there is no combined limit to write."
             )
-        limits = self.spin_output(spin)["limits"]
-        limits.parent.touch()
-        shutil.copy2(headline.path, limits.path)
+        self.output()["limits"].parent.touch()
+        shutil.copy2(headline.path, self.output()["limits"].path)

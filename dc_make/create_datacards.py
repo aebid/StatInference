@@ -34,13 +34,6 @@ if __name__ == "__main__":
         default=None,
         help="parameter values to run only certain masses",
     )
-    parser.add_argument(
-        "--spin",
-        required=False,
-        type=str,
-        default=None,
-        help="the spin of a configuration that declares `spins:`: the card to build",
-    )
     for param in DatacardMaker.customizeble_parameters:
         parser.add_argument(
             f"--{param}",
@@ -74,7 +67,6 @@ if __name__ == "__main__":
         args.input,
         hist_bins=hist_bins,
         param_values=param_values,
-        spin=args.spin,
         **kwargs,
     )
     maker.createDatacards(args.output)

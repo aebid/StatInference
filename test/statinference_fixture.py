@@ -124,22 +124,6 @@ def card(preprocess):
     )
 
 
-#: the spins of the card with a spin axis, and the signal model each one names
-SPINS = {"0": "Radion", "2": "Graviton"}
-
-
-def spin_card():
-    """The preprocessed card with a `spins:` axis: its signal and a preprocess argument name
-    the spin."""
-    text = card(preprocess=True).replace("Signal_${MX}", "${MODEL}_${MX}")
-    text = text.replace("    - ${ERA}\n", "    - ${ERA}_spin${SPIN}\n")
-    return (
-        "spins:\n"
-        + "".join(f"  {spin}: {{ MODEL: {model} }}\n" for spin, model in SPINS.items())
-        + text
-    )
-
-
 #: the analysis configuration; {store} is the scratch directory the file systems point to,
 #: {card} the datacard configuration StatInference reads
 FILES = {
@@ -169,7 +153,6 @@ StatInference:
     ),
     "config/Datacards/card.yaml": card(preprocess=False),
     "config/Datacards/card_preprocess.yaml": card(preprocess=True),
-    "config/Datacards/card_spins.yaml": spin_card(),
 }
 for _era in ERAS + (EXTRA_ERA,):
     FILES[f"config/{_era}/processes.yaml"] = "data:\n  datasets: [ Data ]\n"

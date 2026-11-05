@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The card stages over several eras: one workflow whose branches are the cards.
+"""The card stages over several eras: one workflow whose branches are the cards' mass points.
 
 On the scratch analysis of statinference_fixture (cards Run3_Early = Run3_2022 + Run3_2022EE,
 Run3_2022 and Run3_2023, in that order; Run3_2023BPix configured but behind no card):
@@ -7,16 +7,19 @@ Run3_2022 and Run3_2023, in that order; Run3_2023BPix configured but behind no c
 * `--era` must hold every real era behind the cards: over fewer, the tasks a run starts from
   that are not workflows raise when constructed, a card workflow when its map is built, naming
   the card and the missing eras, and luigi runs nothing; more eras give the same cards. A
-  --branches selection of cards reaches their inputs and their preprocessing. A configuration without `eras:` raises.
+  --branches selection of mass points reaches their cards' inputs and preprocessing. A
+  configuration without `eras:` raises.
+* CreateDatacardsTask has a branch per card and mass point, card by card and mass by mass:
+  every mass the configuration declares, or those of the `StatInference` param_values.
 * Constructing a card workflow over one era does not raise: FLAF builds single-era
   instances of a remote workflow for its luigi resources.
 * The job state and the logs do not depend on `--era`: one job directory, one luigi
   token and one log directory per version and class, the same over more eras.
-* Branch i of CreateDatacardsTask requires branch i of PreprocessShapesTask, the same card;
-  every branch task carries all eras of the run, and each merged histogram is read with its
-  own era.
+* Every mass branch of a card in CreateDatacardsTask requires the branch of that card in
+  PreprocessShapesTask (one per card); every branch task carries all eras of the run, and
+  each merged histogram is read with its own era.
 * ResonantLimitsTask requires the one card workflow over the run's eras and stages each card
-  from that card's branch; ResonantLimitsAndHistPlotTask requires one HistPlotTask over the
+  from the branches of that card's masses; ResonantLimitsAndHistPlotTask requires one HistPlotTask over the
   run's eras, and its marker is keyed on the version alone.
 * A setting a run reads once must agree between its eras: the `StatInference` block, and
   the var_list of a plotted variable between the eras summed in one plot.
@@ -76,6 +79,24 @@ class CardTestCase(unittest.TestCase):
         return os.path.join(self.tmp, "data", VERSION, *path)
 
 
+def card_masses(masses=fx.MASSES):
+    """The branch map of the card workflow: every (card era, mass), card by card."""
+    return dict(
+        enumerate(
+            {"era": card_era, "mass": mass}
+            for card_era in fx.CARD_ERAS
+            for mass in masses
+        )
+    )
+
+
+def branches_of(card_era):
+    """The branches of the card workflow that build `card_era`."""
+    return tuple(
+        branch for branch, data in card_masses().items() if data["era"] == card_era
+    )
+
+
 class CardsNeedTheirEras(CardTestCase):
     def test_fewer_eras_name_the_missing_ones(self):
         for cls in (fx.si.CreateDatacardsTask, fx.si.PreprocessShapesTask):
@@ -93,9 +114,25 @@ class CardsNeedTheirEras(CardTestCase):
         for eras in (fx.ERAS, WITH_EXTRA):
             with self.subTest(eras=eras):
                 workflow = self.task(fx.si.CreateDatacardsTask, eras=eras)
-                self.assertEqual(
-                    workflow.get_branch_map(), dict(enumerate(fx.CARD_ERAS))
-                )
+                self.assertEqual(workflow.get_branch_map(), card_masses())
+
+
+class RestrictedMasses(CardTestCase):
+    """global.yaml's `StatInference` param_values restricts the mass points."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        path = os.path.join(cls.ana, "config", "global.yaml")
+        with open(path) as f:
+            text = f.read()
+        fx.write(
+            path, text.replace("  hist_bins:", "  param_values: [ 300 ]\n  hist_bins:")
+        )
+
+    def test_only_the_restricted_masses_are_branches(self):
+        workflow = self.task(fx.si.CreateDatacardsTask)
+        self.assertEqual(workflow.get_branch_map(), card_masses([300]))
 
     def test_a_run_starting_from_the_limits_stops_at_construction(self):
         """The tasks a run starts from that are not workflows refuse too few eras when
@@ -184,12 +221,15 @@ class CardsPairAndCarryEveryEra(CardTestCase):
 
     def test_each_card_reads_the_preprocessed_shapes_of_that_card(self):
         cards = self.task(fx.si.CreateDatacardsTask).get_branch_tasks()
+        self.assertEqual(len(cards), len(fx.CARD_ERAS) * len(fx.MASSES))
         outputs = set()
-        for branch, card in cards.items():
+        for card in cards.values():
             (preprocess,) = card.requires()
             self.assertIsInstance(preprocess, fx.si.PreprocessShapesTask)
-            self.assertEqual(preprocess.branch, branch)
-            self.assertEqual(preprocess.branch_data, card.branch_data)
+            self.assertEqual(
+                preprocess.branch, fx.CARD_ERAS.index(card.branch_data["era"])
+            )
+            self.assertEqual(preprocess.branch_data, card.branch_data["era"])
             outputs.add(preprocess.output().abspath)
         self.assertEqual(len(outputs), len(fx.CARD_ERAS))
 
@@ -218,8 +258,11 @@ class SelectedCards(CardTestCase):
     card_file = "config/Datacards/card_preprocess.yaml"
 
     def test_a_selection_reaches_the_preprocessing(self):
-        workflow = self.task(fx.si.CreateDatacardsTask, branches=(1,))
-        self.assertEqual(workflow.get_branch_map(), {1: fx.CARD_ERAS[1]})
+        branches = branches_of(fx.CARD_ERAS[1])
+        workflow = self.task(fx.si.CreateDatacardsTask, branches=branches)
+        self.assertEqual(
+            workflow.get_branch_map(), {b: card_masses()[b] for b in branches}
+        )
         preprocess = workflow.workflow_requires()["PreprocessShapes"]
         self.assertEqual(preprocess.get_branch_map(), {1: fx.CARD_ERAS[1]})
         reqs = luigi.task.flatten(preprocess.workflow_requires())
@@ -228,7 +271,7 @@ class SelectedCards(CardTestCase):
 
 class SelectedCardsWithoutPreprocess(CardTestCase):
     def test_a_selection_requires_its_cards_inputs_only(self):
-        workflow = self.task(fx.si.CreateDatacardsTask, branches=(0,))
+        workflow = self.task(fx.si.CreateDatacardsTask, branches=branches_of(fx.GROUP))
         reqs = luigi.task.flatten(workflow.workflow_requires())
         self.assertEqual({r.hist_era for r in reqs}, set(fx.SUB_ERAS[fx.GROUP]))
 
@@ -243,12 +286,21 @@ class LimitsOverTheCards(CardTestCase):
         self.assertEqual(cards.branches, ())
         outputs = limits.era_card_outputs()
         self.assertEqual(list(outputs), fx.CARD_ERAS)
-        for card_era, output in outputs.items():
+        for card_era, card_outputs in outputs.items():
             self.assertEqual(
-                output.abspath,
-                os.path.join(
-                    self.tmp, "store", "default", VERSION, "Datacards", card_era
-                ),
+                [output.abspath for output in card_outputs],
+                [
+                    os.path.join(
+                        self.tmp,
+                        "store",
+                        "default",
+                        VERSION,
+                        "Datacards",
+                        card_era,
+                        f"MX_{mass}",
+                    )
+                    for mass in fx.MASSES
+                ],
             )
 
     def test_one_histplot_over_the_runs_eras(self):

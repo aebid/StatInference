@@ -6,21 +6,23 @@ card Run3_Early = Run3_2022 + Run3_2022EE, a card for its member Run3_2022 and o
 Run3_2023; Run3_2022EE reads its histograms from a store of its own), with and without a
 `preprocess:` step:
 
-* one card per era the configuration lists, written to `<fs_default>/<v>/Datacards/<card>`
-  by the card's payload;
+* one branch per card era the configuration lists and mass point, written to
+  `<fs_default>/<v>/Datacards/<card>/MX_<mass>` by the card's payload for that mass alone;
 * the merged histograms a card reads are its sub-eras' variables, each from its own era's
   `fs_HistTuple` under --hists-version, required by the card and by its workflow; with
   `preprocess:` the card reads the preprocessed shapes
   `<fs_default>/<v>/Hists_preprocessed/<card>`, which are built from that same set; a
   missing one is named;
 * ResonantLimitsTask writes `limits.npz`, `era_limits/` and `Datacards/combined` where it
-  always has, mirrors each card to `Datacards/<card>`, merges each card's limits on their
-  own and combines only the top-level cards (the group, not its member);
+  always has, mirrors every mass of a card into the one `Datacards/<card>`, merges each
+  card's limits on their own and combines only the top-level cards (the group, not its
+  member);
 * ResonantLimitsAndHistPlotTask requires the HistPlots of every real era behind the cards,
   which the eras of the root task cover, under --hists-version;
 * the payload commands name the card era (`--eras`, `--era`, `${ERA}` in `hist_bins` and in
-  the preprocess arguments) and the shape plots the card era as the year and its first
-  sub-era as the era; no plot without `make_plots`.
+  the preprocess arguments) and the branch's mass (`--param_values`), and the shape plots,
+  of that mass's variable only, the card era as the year and its first sub-era as the era;
+  no plot without `make_plots`.
 
 `root_params()`, `card_workflows()` and the `*_of()` helpers are the only places that know
 which eras the root task takes and how a card's task is reached from the limits; everything
@@ -67,14 +69,14 @@ def limits_and_histplot_task():
 
 def card_workflows(limits):
     """The CreateDatacardsTask workflows `limits` requires: one, whose branches are the
-    cards."""
+    cards' mass points."""
     return luigi.task.flatten(limits.requires())
 
 
 def cards_of(limits):
-    """{card era: the task that writes that card}."""
+    """{(card era, mass): the task that writes that card's mass point}."""
     return {
-        task.branch_data: task
+        (task.branch_data["era"], task.branch_data["mass"]): task
         for workflow in card_workflows(limits)
         for task in workflow.get_branch_tasks().values()
     }
@@ -114,6 +116,11 @@ class _ROOT:
         @staticmethod
         def Open(path):
             return _ShapeFile()
+
+
+def every_card_mass():
+    """{(card era, mass)} over every card and mass point of the configuration."""
+    return {(card_era, mass) for card_era in fx.CARD_ERAS for mass in fx.MASSES}
 
 
 class ChainTestCase(unittest.TestCase):
@@ -157,21 +164,26 @@ class ChainTestCase(unittest.TestCase):
             f"{variable}.root",
         )
 
-    def merged_hists(self, card_era):
+    @staticmethod
+    def variables_of(mass):
+        """The input variables of `mass`, or of every mass for None."""
+        return fx.VARIABLES if mass is None else [fx.VARIABLES[fx.MASSES.index(mass)]]
+
+    def merged_hists(self, card_era, mass=None):
         return {
             self.merged_hist(era, variable)
             for era in fx.SUB_ERAS[card_era]
-            for variable in fx.VARIABLES
+            for variable in self.variables_of(mass)
         }
 
     def every_merged_hist(self):
         return set().union(*(self.merged_hists(e) for e in fx.CARD_ERAS))
 
-    def staged_layout(self, card_era):
+    def staged_layout(self, card_era, mass=None):
         return {
             os.path.join(era, variable, f"{variable}.root")
             for era in fx.SUB_ERAS[card_era]
-            for variable in fx.VARIABLES
+            for variable in self.variables_of(mass)
         }
 
     def write_merged_hists(self):
@@ -221,22 +233,23 @@ class PlainChainTest(ChainTestCase):
 
     card_file = "config/Datacards/card.yaml"
 
-    def test_one_card_per_configured_era(self):
-        self.assertEqual(set(cards_of(limits_task())), set(fx.CARD_ERAS))
+    def test_one_branch_per_configured_era_and_mass(self):
+        self.assertEqual(set(cards_of(limits_task())), every_card_mass())
 
     def test_card_outputs(self):
-        for card_era, card in cards_of(limits_task()).items():
+        for (card_era, mass), card in cards_of(limits_task()).items():
             self.assertEqual(
                 card.output().abspath,
-                self.store("default", VERSION, "Datacards", card_era),
+                self.store("default", VERSION, "Datacards", card_era, f"MX_{mass}"),
             )
 
     def test_card_inputs_are_the_sub_eras_merged_histograms(self):
-        for card_era, card in cards_of(limits_task()).items():
+        """Of the branch's own mass: a mass branch does not stage the other masses'."""
+        for (card_era, mass), card in cards_of(limits_task()).items():
             reqs = luigi.task.flatten(card.requires())
             self.assertTrue(all(isinstance(r, fx.si.MergedHists) for r in reqs))
             self.assertEqual(
-                {r.output().abspath for r in reqs}, self.merged_hists(card_era)
+                {r.output().abspath for r in reqs}, self.merged_hists(card_era, mass)
             )
 
     def test_workflows_require_every_cards_inputs(self):
@@ -270,22 +283,22 @@ class PlainChainTest(ChainTestCase):
             )
 
     def test_limits_merge_each_card_and_combine_the_top_level_ones(self):
-        """ResonantLimitsTask.run() up to its dynamic dependencies: each card mirrored from
-        its own output, one merge per card, and the combination of the cards that are not a
-        member of a group."""
+        """ResonantLimitsTask.run() up to its dynamic dependencies: every mass of a card
+        mirrored from its own output into the one directory of the card, one merge per
+        card, and the combination of the cards that are not a member of a group."""
         limits = limits_task()
-        for card_era in fx.CARD_ERAS:
-            for mass in fx.MASSES:
-                fx.write(
-                    self.store(
-                        "default",
-                        VERSION,
-                        "Datacards",
-                        card_era,
-                        f"datacard_{card_era}_{mass}.txt",
-                    ),
+        for card_era, mass in every_card_mass():
+            fx.write(
+                self.store(
+                    "default",
+                    VERSION,
+                    "Datacards",
                     card_era,
-                )
+                    f"MX_{mass}",
+                    f"datacard_{card_era}_{mass}.txt",
+                ),
+                card_era,
+            )
         combine_calls = []
 
         def combine(cmd, stdout=None, **kwargs):
@@ -314,6 +327,14 @@ class PlainChainTest(ChainTestCase):
             for card_era in fx.CARD_ERAS
         }
         for card_era, paths in cards.items():
+            # the masses side by side, as when one task wrote them all
+            self.assertEqual(
+                {
+                    os.path.join(limits.datacards_dir(card_era), name)
+                    for name in os.listdir(limits.datacards_dir(card_era))
+                },
+                paths,
+            )
             for path in paths:
                 with open(path) as f:
                     self.assertEqual(f.read(), card_era)
@@ -359,8 +380,8 @@ class PlainChainTest(ChainTestCase):
     def test_payload_commands(self):
         self.write_merged_hists()
         ana = self.ana
-        for card_era, card in cards_of(limits_task()).items():
-            with self.subTest(card=card_era):
+        for (card_era, mass), card in cards_of(limits_task()).items():
+            with self.subTest(card=card_era, mass=mass):
                 calls = self.run_payload(card, create_datacards_module)
                 (maker,) = [c for c in calls if "--eras" in c[0]]
                 cmd, env, files = maker
@@ -379,27 +400,31 @@ class PlainChainTest(ChainTestCase):
                     self.arg(cmd, "--hist-bins"),
                     os.path.join(ana, "config", "Datacards", f"bins_{card_era}.json"),
                 )
-                self.assertEqual(self.arg(cmd, "--param_values"), "300")
+                self.assertEqual(cmd.count("--param_values"), 1)
+                self.assertEqual(self.arg(cmd, "--param_values"), str(mass))
                 self.assertEqual(env, {"CMSSW_ENV": "1"})
-                self.assertEqual(files, self.staged_layout(card_era))
+                self.assertEqual(files, self.staged_layout(card_era, mass))
                 self.assertIn("payload_output", os.listdir(card.output().abspath))
 
-                plots = [c[0] for c in calls if "--all_keys" in c[0]]
-                self.assertEqual(len(plots), len(fx.VARIABLES))
-                for plot in plots:
-                    self.assertEqual(self.arg(plot, "--year"), card_era)
-                    self.assertEqual(self.arg(plot, "--era"), fx.SUB_ERAS[card_era][0])
-                    self.assertEqual(self.arg(plot, "--LAWrunVersion"), VERSION)
-                    # HistPlotter builds its Setup from these, so no config file
-                    self.assertEqual(self.arg(plot, "--ana_path"), ana)
-                    self.assertNotIn("--globalConfig", plot)
-                    # the surviving axis of the 2D variable: y without a binning record
-                    self.assertEqual(self.arg(plot, "--var"), "HME")
+                # the variable of this mass only
+                (plot,) = [c[0] for c in calls if "--all_keys" in c[0]]
+                self.assertEqual(
+                    os.path.basename(self.arg(plot, "--inFile")),
+                    f"_summed_{fx.VARIABLES[fx.MASSES.index(mass)]}.root",
+                )
+                self.assertEqual(self.arg(plot, "--year"), card_era)
+                self.assertEqual(self.arg(plot, "--era"), fx.SUB_ERAS[card_era][0])
+                self.assertEqual(self.arg(plot, "--LAWrunVersion"), VERSION)
+                # HistPlotter builds its Setup from these, so no config file
+                self.assertEqual(self.arg(plot, "--ana_path"), ana)
+                self.assertNotIn("--globalConfig", plot)
+                # the surviving axis of the 2D variable: y without a binning record
+                self.assertEqual(self.arg(plot, "--var"), "HME")
 
     def test_no_plots_without_make_plots(self):
         self.write_merged_hists()
-        for card_era, card in cards_of(limits_task()).items():
-            with self.subTest(card=card_era):
+        for (card_era, mass), card in cards_of(limits_task()).items():
+            with self.subTest(card=card_era, mass=mass):
                 card = fx.si.CreateDatacardsTask.req(
                     card, make_plots=False, _skip_task_excludes=True
                 )
@@ -415,7 +440,7 @@ class PlainChainTest(ChainTestCase):
 
     def test_a_failed_plot_fails_the_card(self):
         self.write_merged_hists()
-        card = cards_of(limits_task())[fx.GROUP]
+        card = cards_of(limits_task())[(fx.GROUP, fx.MASSES[0])]
         with self.assertRaises(RuntimeError) as raised:
             self.run_payload(
                 card, create_datacards_module, fail=lambda cmd: "--all_keys" in cmd
@@ -428,7 +453,7 @@ class PlainChainTest(ChainTestCase):
         self.write_merged_hists()
         missing = self.merged_hist(fx.ERA_B, fx.VARIABLES[0])
         os.remove(missing)
-        card = cards_of(limits_task())[fx.GROUP]
+        card = cards_of(limits_task())[(fx.GROUP, fx.MASSES[0])]
         with self.assertRaises(RuntimeError) as raised:
             self.run_payload(card, create_datacards_module)
         message = str(raised.exception)
@@ -442,8 +467,10 @@ class PreprocessChainTest(ChainTestCase):
     card_file = "config/Datacards/card_preprocess.yaml"
 
     def test_card_reads_its_preprocessed_shapes(self):
-        for card_era, card in cards_of(limits_task()).items():
+        for (card_era, _), card in cards_of(limits_task()).items():
             preprocess = preprocess_of(card)
+            # every mass of a card reads the one preprocessing branch of that card
+            self.assertEqual(preprocess.branch, fx.CARD_ERAS.index(card_era))
             self.assertEqual(
                 preprocess.output().abspath,
                 self.store("default", VERSION, "Hists_preprocessed", card_era),
@@ -474,9 +501,12 @@ class PreprocessChainTest(ChainTestCase):
     def test_preprocess_command(self):
         self.write_merged_hists()
         ana = self.ana
-        for card_era, card in cards_of(limits_task()).items():
+        preprocess_of_card = {
+            card_era: preprocess_of(card)
+            for (card_era, _), card in cards_of(limits_task()).items()
+        }
+        for card_era, preprocess in preprocess_of_card.items():
             with self.subTest(card=card_era):
-                preprocess = preprocess_of(card)
                 (call,) = self.run_payload(preprocess, preprocess_module)
                 cmd, env, files = call
                 self.assertEqual(
@@ -504,8 +534,8 @@ class PreprocessChainTest(ChainTestCase):
                 self.assertIn("payload_output", os.listdir(preprocess.output().abspath))
 
     def test_create_datacards_reads_the_preprocessed_shapes(self):
-        for card_era, card in cards_of(limits_task()).items():
-            with self.subTest(card=card_era):
+        for (card_era, mass), card in cards_of(limits_task()).items():
+            with self.subTest(card=card_era, mass=mass):
                 preprocessed = preprocess_of(card).output().abspath
                 fx.write(os.path.join(preprocessed, card_era, "marker.root"), "")
                 calls = self.run_payload(card, create_datacards_module)
@@ -513,6 +543,62 @@ class PreprocessChainTest(ChainTestCase):
                 cmd, _, files = maker
                 self.assertEqual(self.arg(cmd, "--eras"), card_era)
                 self.assertEqual(files, {os.path.join(card_era, "marker.root")})
+
+
+class StageMassDirTest(unittest.TestCase):
+    """ResonantLimitsTask._merge_mass_dir: how one mass's output joins its era's mirror."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.dest = os.path.join(self.tmp, "era")
+        self.merge = limits_module.ResonantLimitsTask._merge_mass_dir
+
+    def mass_dir(self, mass, files):
+        src = os.path.join(self.tmp, f"src_{mass}")
+        for rel in files:
+            path = os.path.join(src, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(f"{mass}\n")
+        return src
+
+    def tree(self):
+        return {
+            os.path.relpath(os.path.join(root, name), self.dest)
+            for root, _, files in os.walk(self.dest)
+            for name in files
+        }
+
+    def test_masses_side_by_side_and_plots_per_mass(self):
+        for mass in (300, 1000):
+            src = self.mass_dir(
+                mass,
+                [
+                    f"datacard_{mass}.txt",
+                    f"era/eE/datacard_{mass}.txt",
+                    "plots/DNN_eE_SR_res2b.pdf",
+                ],
+            )
+            self.merge(src, self.dest, f"MX_{mass}")
+        self.assertEqual(
+            self.tree(),
+            {
+                "datacard_300.txt",
+                "datacard_1000.txt",
+                "era/eE/datacard_300.txt",
+                "era/eE/datacard_1000.txt",
+                "plots/MX_300/DNN_eE_SR_res2b.pdf",
+                "plots/MX_1000/DNN_eE_SR_res2b.pdf",
+            },
+        )
+
+    def test_a_path_written_by_two_masses_raises(self):
+        self.merge(self.mass_dir(300, ["shapes.root"]), self.dest, "MX_300")
+        with self.assertRaisesRegex(RuntimeError, "shapes.root.*another mass point"):
+            self.merge(self.mass_dir(1000, ["shapes.root"]), self.dest, "MX_1000")
+        with open(os.path.join(self.dest, "shapes.root")) as f:
+            self.assertEqual(f.read(), "300\n")
 
 
 if __name__ == "__main__":

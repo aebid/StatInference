@@ -78,6 +78,7 @@ EXTRA_ERA = "Run3_2023BPix"
 CARD_ERAS = [GROUP, ERA_A, ERA_C]
 SUB_ERAS = {GROUP: [ERA_A, ERA_B], ERA_A: [ERA_A], ERA_C: [ERA_C]}
 
+#: the mass points of every card, each a branch of its own: global.yaml restricts none
 MASSES = [300, 500]
 VARIABLES = [f"DNN_m{m}_vs_HME" for m in MASSES]
 
@@ -142,7 +143,6 @@ histTuple_flavors:
 StatInference:
   config: {card}
   hist_bins: config/Datacards/bins_${ERA}.json
-  param_values: [ 300 ]
 """,
     f"config/{ERA_B}/global.yaml": "fs_HistTuple: {store}/hists_2022EE\n",
     "config/phys_models.yaml": "M:\n  backgrounds: [ TT ]\n  data: [ data ]\n",

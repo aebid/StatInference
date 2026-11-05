@@ -4,9 +4,9 @@
 The maker reads a mapped datacard category from its input directory, with the model point
 substituted (`SR/res2b` from `SR_SL_M${MX}/res2b`); the plots must show the same histograms.
 On the scratch analysis of statinference_fixture with a single-lepton-like card (two mass
-points, two mapped categories and one read under its own name), HistPlotter is asked for the
-input directory of each mapped category and point, also when a directory under the configured
-name exists too; the plot files and the grids keep the datacard bin's name; with nothing to
+points, two mapped categories and one read under its own name), the branch of each mass plots
+that mass's variable alone, and HistPlotter is asked for the input directory of each mapped
+category, also when a directory under the configured name exists too; the plot files and the grids keep the datacard bin's name; with nothing to
 plot the paths looked up, an unreadable summed file or the lack of a category read from one
 directory are named and the summed shapes removed; the plotter gets the task's --user-custom; a
 category the points of one variable read from different directories is not plotted.
@@ -150,14 +150,17 @@ class ShapePlotsTest(unittest.TestCase):
                 "",
             )
 
-    def card(self, **params):
-        return fx.si.CreateDatacardsTask(
+    def card(self, mass, **params):
+        """The branch of the one card that builds `mass`."""
+        card = fx.si.CreateDatacardsTask(
             version=VERSION,
             era=fx.ERA_A,
             hists_version=HISTS_VERSION,
-            branch=0,
+            branch=MASSES.index(mass),
             **params,
         )
+        self.assertEqual(card.branch_data, {"era": fx.ERA_A, "mass": mass})
+        return card
 
     def plot(self, card, directories_of, root=None):
         """Run `card` with its commands recorded: (HistPlotter commands, the grids' panel
@@ -212,11 +215,13 @@ class ShapePlotsTest(unittest.TestCase):
         return keys, outputs, panels
 
     def check_plots(self, card, directories_of):
+        """The plots of `card`: those of its own mass's variable only."""
+        mass = card.branch_data["mass"]
         plotter, grids, left, _ = self.plot(card, directories_of)
-        self.assertEqual(len(plotter), len(MASSES))
+        self.assertEqual(len(plotter), 1)
         for cmd, (grid_var, panels) in zip(plotter, grids):
             var = os.path.basename(self.arg(cmd, "--inFile"))[len("_summed_") : -5]
-            (mass,) = [m for m in MASSES if variable(m) == var]
+            self.assertEqual(var, variable(mass))
             keys, outputs, expected_panels = self.expected(mass)
             self.assertEqual(self.arg(cmd, "--all_keys").split(","), keys)
             # in the plots/ directory of the card's output, while the task writes it
@@ -234,27 +239,43 @@ class ShapePlotsTest(unittest.TestCase):
         return plotter
 
     def test_mapped_categories_are_plotted_from_their_input_directory(self):
-        self.check_plots(self.card(), {variable(m): sl_directories(m) for m in MASSES})
+        for mass in MASSES:
+            with self.subTest(mass=mass):
+                self.check_plots(
+                    self.card(mass), {variable(m): sl_directories(m) for m in MASSES}
+                )
 
     def test_the_input_directory_wins_over_one_of_the_configured_name(self):
-        self.check_plots(
-            self.card(),
-            {variable(m): sl_directories(m, with_configured_name=True) for m in MASSES},
-        )
+        for mass in MASSES:
+            with self.subTest(mass=mass):
+                self.check_plots(
+                    self.card(mass),
+                    {
+                        variable(m): sl_directories(m, with_configured_name=True)
+                        for m in MASSES
+                    },
+                )
 
     def test_nothing_to_plot_names_the_paths_looked_up(self):
-        plotter, _, left, printed = self.plot(self.card(), {})
-        self.assertEqual(plotter, [])
-        self.assertEqual(left, [])
         for mass in MASSES:
-            (warning,) = [
-                line
-                for line in printed
-                if line.startswith(f"WARNING: no shapes to plot for {variable(mass)}")
-            ]
-            for channel in CHANNELS:
-                self.assertIn(f"{channel}/SR_SL_M{mass}/res2b", warning)
-                self.assertIn(f"{channel}/OS_Iso/inclusive", warning)
+            with self.subTest(mass=mass):
+                plotter, _, left, printed = self.plot(self.card(mass), {})
+                self.assertEqual(plotter, [])
+                self.assertEqual(left, [])
+                # one warning, for this mass's variable
+                (warning,) = [
+                    line
+                    for line in printed
+                    if line.startswith("WARNING: no shapes to plot for")
+                ]
+                self.assertTrue(
+                    warning.startswith(
+                        f"WARNING: no shapes to plot for {variable(mass)}:"
+                    )
+                )
+                for channel in CHANNELS:
+                    self.assertIn(f"{channel}/SR_SL_M{mass}/res2b", warning)
+                    self.assertIn(f"{channel}/OS_Iso/inclusive", warning)
 
     def test_an_unreadable_summed_file_is_named(self):
         class Unreadable:
@@ -263,18 +284,21 @@ class ShapePlotsTest(unittest.TestCase):
                 def Open(path):
                     return None
 
-        plotter, _, left, printed = self.plot(self.card(), {}, root=Unreadable)
-        self.assertEqual(plotter, [])
-        self.assertEqual(left, [])
         for mass in MASSES:
-            var = variable(mass)
-            pattern = (
-                f"WARNING: no shapes to plot for {var}: "
-                f".*/plots/_summed_{var}\\.root cannot be read"
-            )
-            self.assertTrue(
-                any(re.fullmatch(pattern, line) for line in printed), printed
-            )
+            with self.subTest(mass=mass):
+                plotter, _, left, printed = self.plot(
+                    self.card(mass), {}, root=Unreadable
+                )
+                self.assertEqual(plotter, [])
+                self.assertEqual(left, [])
+                var = variable(mass)
+                pattern = (
+                    f"WARNING: no shapes to plot for {var}: "
+                    f".*/plots/_summed_{var}\\.root cannot be read"
+                )
+                self.assertTrue(
+                    any(re.fullmatch(pattern, line) for line in printed), printed
+                )
 
     def test_no_category_from_one_directory_is_named(self):
         with mock.patch.object(
@@ -282,27 +306,31 @@ class ShapePlotsTest(unittest.TestCase):
             "_present_keys",
             staticmethod(lambda shape_file, cfg, points: ({}, [])),
         ):
-            plotter, _, left, printed = self.plot(self.card(), {})
-        self.assertEqual(plotter, [])
-        self.assertEqual(left, [])
-        for mass in MASSES:
-            self.assertIn(
-                f"WARNING: no shapes to plot for {variable(mass)}: "
-                "no category is read from one directory",
-                printed,
-            )
+            for mass in MASSES:
+                with self.subTest(mass=mass):
+                    plotter, _, left, printed = self.plot(self.card(mass), {})
+                    self.assertEqual(plotter, [])
+                    self.assertEqual(left, [])
+                    self.assertIn(
+                        f"WARNING: no shapes to plot for {variable(mass)}: "
+                        "no category is read from one directory",
+                        printed,
+                    )
 
     def test_the_plotter_gets_the_user_custom(self):
         directories = {variable(m): sl_directories(m) for m in MASSES}
-        for cmd in self.check_plots(self.card(), directories):
+        mass = MASSES[0]
+        for cmd in self.check_plots(self.card(mass), directories):
             self.assertNotIn("--user-custom", cmd)
         fx.clear_process_caches()
         user_custom = os.path.join(self.ana, "config", "user_custom_plots.yaml")
-        for cmd in self.check_plots(self.card(user_custom=user_custom), directories):
+        for cmd in self.check_plots(
+            self.card(mass, user_custom=user_custom), directories
+        ):
             self.assertEqual(self.arg(cmd, "--user-custom"), user_custom)
 
     def test_a_category_read_from_several_directories_is_not_plotted(self):
-        card = self.card()
+        card = self.card(MASSES[0])
         cfg = card.get_config_data()
         printed = []
         with mock.patch.object(

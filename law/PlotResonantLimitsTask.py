@@ -25,7 +25,9 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
 
     Each entry of the config's ``limit_plots`` block becomes one dhi
     PlotMultipleResonantLimits task: a list of datacard globs with the labels they should
-    carry, optional external limit curves, and the plot styling. Globs are relative to the
+    carry, optional external limit curves (a dhi file, or ``{file, key}`` picking curves out
+    of a file of several references; see external_limit_file()), and the plot styling.
+    Globs are relative to the
     era's datacards directory and may use ``${ERA}``; the per-channel and per-category
     sub-directories they address come from DatacardMaker.writeDatacards.
 
@@ -57,6 +59,56 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
 
     def _resolve_config_path(self, path):
         return path if os.path.isabs(path) else os.path.join(self.ana_path(), path)
+
+    def external_limit_file(self, item, entry, out_dir):
+        """The dhi external-limits file of one item of an entry's ``external_limits``.
+
+        A string is a dhi external-limits file, passed as it is (relative to the analysis
+        area unless absolute): dhi draws every curve in it. ``{file, key}`` picks curves out
+        of a file holding several references, e.g. one curve per channel and signal:
+
+            external_limits:
+              - { file: config/Datacards/run2_external_limits.json, key: DL/spin0 }
+
+        `key` is a "/"-separated path into the file's mappings, ending at one dhi curve
+        ({name, scan_parameter, limits, ...}) or a list of them. The selected curves are
+        written as a dhi file into `out_dir`, next to the plot, which is also the record of
+        what was drawn.
+        """
+        name = entry.get("name") or "limits"
+        if isinstance(item, str):
+            return self._resolve_config_path(item)
+        if not isinstance(item, dict) or set(item) != {"file", "key"}:
+            raise RuntimeError(
+                f"limit_plots entry '{name}': an external_limits item is a file name or "
+                f"{{file, key}}, not {item!r}"
+            )
+        path = self._resolve_config_path(item["file"])
+        with open(path) as f:
+            node = json.load(f)
+        for part in str(item["key"]).split("/"):
+            if not isinstance(node, dict) or part not in node:
+                have = ", ".join(sorted(node)) if isinstance(node, dict) else "no keys"
+                raise RuntimeError(
+                    f"limit_plots entry '{name}': {path} has no '{item['key']}' "
+                    f"(no '{part}' at that level; it has {have})"
+                )
+            node = node[part]
+        curves = node if isinstance(node, list) else [node]
+        if not curves or not all(isinstance(c, dict) and "limits" in c for c in curves):
+            raise RuntimeError(
+                f"limit_plots entry '{name}': '{item['key']}' of {path} is not a dhi "
+                "external-limit curve (a mapping with 'limits') or a list of them"
+            )
+        out_path = os.path.join(
+            out_dir,
+            re.sub(r"[^\w.-]+", "_", f"{name}_external_{item['key']}").strip("_")
+            + ".json",
+        )
+        with open(out_path, "w") as f:
+            json.dump(curves, f, indent=2)
+            f.write("\n")
+        return out_path
 
     def common_plot_params(self, entry, era):
         """The dhi parameters an entry's plots share, whatever kind they are.
@@ -100,7 +152,7 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
 
         return params
 
-    def build_plot_spec(self, entry, era, extra_external=()):
+    def build_plot_spec(self, entry, era, extra_external=(), out_dir=None):
         """PlotMultipleResonantLimits parameters for a ``limit_plots`` entry and era.
 
         Kept as a plain dict so the same values can both construct the task (to learn
@@ -108,11 +160,15 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
 
         ``extra_external`` holds external-limit files generated for this run (the
         luminosity projections). They come first, so a projection of our own curve is
-        drawn before any fixed reference such as the Run 2 result.
+        drawn before any fixed reference such as the Run 2 result. A ``{file, key}``
+        external limit is written into `out_dir` (see external_limit_file()).
         """
         sequences, names = self.datacard_sequences(entry, era)
+        items = entry.get("external_limits") or []
+        if out_dir is None and any(not isinstance(i, str) for i in items):
+            raise RuntimeError("a {file, key} external limit needs an output directory")
         external = tuple(extra_external) + tuple(
-            self._resolve_config_path(p) for p in entry.get("external_limits") or []
+            self.external_limit_file(i, entry, out_dir) for i in items
         )
 
         return dict(
@@ -307,14 +363,10 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
                         for proj in entry.get("lumi_projections") or []
                     ]
 
-                    specs = [
-                        (
-                            PlotMultipleResonantLimits,
-                            self.build_plot_spec(
-                                entry, era, extra_external=projections
-                            ),
-                        )
-                    ]
+                    overlay = self.build_plot_spec(
+                        entry, era, extra_external=projections, out_dir=dest_dir
+                    )
+                    specs = [(PlotMultipleResonantLimits, overlay)]
                     specs += [
                         (PlotResonantLimits, s)
                         for s in self.build_band_specs(entry, era)
@@ -325,8 +377,11 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
                             os.path.join(era, b)
                             for b in self.draw_plot(task_cls, spec, name, era, dest_dir)
                         )
+                    # the projections and the selected external curves written here
                     produced.extend(
-                        os.path.join(era, os.path.basename(p)) for p in projections
+                        os.path.join(era, os.path.basename(p))
+                        for p in overlay["external_limits"]
+                        if os.path.dirname(p) == dest_dir
                     )
 
             with open(os.path.join(local_output.abspath, "plots.json"), "w") as f:

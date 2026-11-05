@@ -409,6 +409,9 @@ class DatacardMaker:
             factor = 1 - unc_value
         scaled.Scale(factor)
         scaled.SetDirectory(0)
+        # PyROOT does not own what Clone() returns (ROOT >= 6.40), and with importROOT's
+        # AddDirectory(False) no directory does either: the copy would never be freed.
+        ROOT.SetOwnership(scaled, True)
         return scaled
 
     @staticmethod
@@ -476,6 +479,8 @@ class DatacardMaker:
                 sub_down = hist.Clone()
                 sub_up.SetDirectory(0)
                 sub_down.SetDirectory(0)
+                ROOT.SetOwnership(sub_up, True)
+                ROOT.SetOwnership(sub_down, True)
 
             if up_hist is None:
                 up_hist = sub_up
@@ -507,6 +512,8 @@ class DatacardMaker:
             if combined_up is None:
                 combined_up = up.Clone()
                 combined_down = down.Clone()
+                ROOT.SetOwnership(combined_up, True)
+                ROOT.SetOwnership(combined_down, True)
             else:
                 combined_up.Add(up)
                 combined_down.Add(down)
@@ -629,6 +636,7 @@ class DatacardMaker:
                         continue
                     if combined_hist is None:
                         combined_hist = bkg_hist.Clone()
+                        ROOT.SetOwnership(combined_hist, True)
                     else:
                         combined_hist.Add(bkg_hist)
             if combined_hist is None:
@@ -667,6 +675,7 @@ class DatacardMaker:
                 continue
             if combined_hist is None:
                 combined_hist = sub_hist.Clone()
+                ROOT.SetOwnership(combined_hist, True)
             else:
                 combined_hist.Add(sub_hist)
 
@@ -737,6 +746,7 @@ class DatacardMaker:
                         )
                         if hist is None:
                             hist = bkg_hist.Clone()
+                            ROOT.SetOwnership(hist, True)
                         else:
                             hist.Add(bkg_hist)
                 if hist is None:
@@ -858,6 +868,7 @@ class DatacardMaker:
         if key not in self.shapes:
             hist = raw.Clone()
             hist.SetDirectory(0)
+            ROOT.SetOwnership(hist, True)
             self.resolveOrRaiseNegativeBins(
                 hist,
                 process,

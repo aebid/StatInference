@@ -47,6 +47,14 @@ histogram?*
   other.
 - Histogram names are built from the card and must match what the analysis actually wrote. A
   rename on either side is a silent failure at datacard time.
+- In the modules that load ROOT through `importROOT` (`dc_make`), a histogram read (`readHist`)
+  or copied (`Clone()`) is handed to Python with `ROOT.SetOwnership(h, True)`: from ROOT 6.40
+  PyROOT does not own a `Clone()` result, and with `importROOT`'s `TH1.AddDirectory(False)` no
+  directory does, so a copy without it is never freed (`test/test_hist_ownership.py`). Never for
+  an object still in a TFile's directory, as in a script with a plain `import ROOT` and an output
+  file open (`dc_make/rename_shapes.py`): `TFile::Close` deletes it too.
+- A TF1 made in Python is given to C++ by PyROOT, and a fit gives it to C++ again under ROOT 6.36:
+  take it back with `ROOT.SetOwnership(f, True)` after the last call that receives it.
 
 ### Eras
 
@@ -110,13 +118,13 @@ repository has nowhere to put it.
 
 ## Repository facts
 
-Verified 2026-08-27; re-check before relying on any of it.
+Verified 2026-08-27 (Tests row 2026-10-29); re-check before relying on any of it.
 
 | | |
 |---|---|
 | Layout | `dc_make/` (datacard construction: `maker.py`, `create_datacards.py`, `process.py`, `model.py`, `uncertainty.py`, `binner.py`), `bin_opt/` (binning optimisation and limits), `common/` (`tools.py`, `param_parse.py`), `law/tasks.py`, `fit_val/`, `config/`, `legacy/`, `test/` (unit tests and their scratch analysis) |
 | Consumers | HH_bbtautau and HH_bbWW use this as a submodule; H_mumu does not |
 | Cards | analysis-side, e.g. `HH_bbWW/config/Datacards/CI_card.yaml` |
-| Tests | `test/test_law_chain.py` (the law tasks on the real FLAF and law classes over a scratch analysis, `test/statinference_fixture.py`: per card the outputs, inputs and payload commands), `test/test_card_eras.py` (the card workflows over several eras) and `test/test_shape_plots.py` (which histograms a card's shape plots show, through `input_categories`); no ROOT, Combine or dhi; run by `unit-tests` against a pinned FLAF commit |
+| Tests | `test/test_law_chain.py` (the law tasks on the real FLAF and law classes over a scratch analysis, `test/statinference_fixture.py`: per card the outputs, inputs and payload commands), `test/test_card_eras.py` (the card workflows over several eras) and `test/test_shape_plots.py` (which histograms a card's shape plots show, through `input_categories`); no ROOT, Combine or dhi; run by `unit-tests` against a pinned FLAF commit. `test/test_hist_ownership.py` (no histogram copy or fit function of `dc_make` left owned by nobody) needs ROOT, is marked `needs_root` and is not run by `unit-tests` |
 | Workflows | `formatting-check`, `unit-tests`, `repo-sanity-checks` (FLAF's sanity checks and FLAF's `run_tools/check_era_rename.py` for leftovers of the `period` → `era` rename), `trigger-flaf-integration`. Formatting is checked automatically — do not comment on it. A change to an assertion of `test/test_law_chain.py` (not to its helpers) changes what the chain is guaranteed to read, write or run — comment on it |
 | Integration test | Triggered by `@cms-flaf-bot please test`; the pipeline configuration lives in `cms-flaf/FLAF_ci` |

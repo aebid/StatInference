@@ -69,6 +69,9 @@ class Uncertainty:
         fit_func = ROOT.TF1("fit_func", constantFunction, 0, 10, 1)
         fit_func.SetParameter(0, 1.0)
         histogram.Fit(fit_func, "nq")
+        # PyROOT gives a TF1 made in Python to C++, where nothing deletes it. Taken back
+        # after the fit, which under ROOT 6.36 gives it to C++ again.
+        ROOT.SetOwnership(fit_func, True)
         chi2 = fit_func.GetChisquare()
         ndf = fit_func.GetNDF()
         p_value = ROOT.TMath.Prob(chi2, ndf)
@@ -79,6 +82,9 @@ class Uncertainty:
     @staticmethod
     def haveCompatibleShapes(hist_a, hist_b, p_thr):
         hist_b = hist_b.Clone()
+        # PyROOT does not own what Clone() returns (ROOT >= 6.40), and with importROOT's
+        # AddDirectory(False) no directory does either.
+        ROOT.SetOwnership(hist_b, True)
         hist_b.Divide(hist_a)
         _, p_value, _, _ = Uncertainty.fitFlat(hist_b)
         return p_value > p_thr
@@ -354,6 +360,7 @@ class AutoUncertainty(Uncertainty):
         self, nominal_shape, shape_variations, auto_lnN_threshold, asym_value_threshold
     ):
         nominal_shape = nominal_shape.Clone()
+        ROOT.SetOwnership(nominal_shape, True)
         for n in range(0, nominal_shape.GetNbinsX() + 2):
             nominal_shape.SetBinError(n, 0)
         all_compatible = True

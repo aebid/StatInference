@@ -24,10 +24,10 @@ merged histograms as they are:
 ```yaml
 preprocess:
   script: StatInference/bin_opt_2d/rebin_2d.py
-  args: [--binning-config, config/Datacards/binning_2d.yaml]
+  args: [--binning-config, config/Datacards/DL/binning_2d.yaml]
 ```
 
-The knobs live with the analysis (`config/Datacards/binning_2d.yaml`) because they are
+The knobs live with the analysis (`config/Datacards/DL/binning_2d.yaml`) because they are
 analysis configuration; the derived `binning.json` lives with the shapes it produced,
 because it is a product of the run rather than an input to it.
 

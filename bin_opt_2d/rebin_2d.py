@@ -38,7 +38,7 @@ BINNING_JSON = "binning.json"
 # not say otherwise. They belong to an analysis rather than to this file -- what a slice
 # needs to be worth keeping depends on the sample sizes and the selection, and a test
 # configuration wants them at zero -- so every production should state its own in a
-# binning yaml -- see config/Datacards/binning_2d.yaml in HH_bbWW for an annotated
+# binning yaml -- see config/Datacards/DL/binning_2d.yaml in HH_bbWW for an annotated
 # set. This file ships no configuration of its own, only these fallbacks.
 # The figures of merit significance() implements. Named here so the yaml path can be
 # checked against the same list the command line's choices= uses.

@@ -1,4 +1,4 @@
-"""Reading datacard configurations: one card, the files it includes, and the governor.
+"""Reading datacard configurations: one card, the files it includes, and the list of cards.
 
 A *card* is one datacard configuration -- the file dc_make/create_datacards.py builds
 datacards from. It may list shared files under ``include:``; they are merged into it by
@@ -6,12 +6,13 @@ the strict rules below, which never let one file override another. Anything set 
 an error naming both files, so a duplicated or conflicting setting cannot hide behind an
 include.
 
-A *governor* names the cards an analysis builds, each under the name the law tasks use
-for it in their branches and output paths::
+global.yaml's StatInference block names the cards an analysis builds, each under the name
+the law tasks use for it in their branches and output paths (resolve_cards() checks it)::
 
-    cards:
-      DL_spin0: DL/dl_spin0.yaml
-      DL_spin2: DL/dl_spin2.yaml
+    StatInference:
+      cards:
+        DL_spin0: config/Datacards/DL/dl_spin0.yaml
+        DL_spin2: config/Datacards/DL/dl_spin2.yaml
 
 Merge rules (includes first, in their order, then the card itself):
 
@@ -45,7 +46,6 @@ NAMED_LISTS = {
 }
 
 INCLUDE_KEY = "include"
-GOVERNOR_KEY = "cards"
 
 #: a card name becomes a directory in the output paths
 _CARD_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -120,27 +120,17 @@ def load_card_config_with_sources(path):
     """
     path = os.path.abspath(path)
     card = _read_yaml(path)
-    if GOVERNOR_KEY in card:
-        raise CardConfigError(
-            f"{path}: `{GOVERNOR_KEY}:` belongs to a governor, which lists cards; a card "
-            "cannot also be one"
-        )
     include_paths = _include_paths(path, card)
     uses_includes = bool(include_paths)
 
     files = []
     for include in include_paths:
         data = _read_yaml(include)
-        for forbidden in (INCLUDE_KEY, GOVERNOR_KEY):
-            if forbidden in data:
-                raise CardConfigError(
-                    f"{include} (included by {path}) sets `{forbidden}:`; included files "
-                    + (
-                        "cannot include further files"
-                        if forbidden == INCLUDE_KEY
-                        else "cannot be governors"
-                    )
-                )
+        if INCLUDE_KEY in data:
+            raise CardConfigError(
+                f"{include} (included by {path}) sets `{INCLUDE_KEY}:`; included files "
+                "cannot include further files"
+            )
         files.append((include, data))
     files.append((path, {k: v for k, v in card.items() if k != INCLUDE_KEY}))
 
@@ -207,55 +197,41 @@ def dump_card_config(path, out_path, relative_to=None):
     return merged
 
 
-def load_governor(path):
-    """{card name: absolute path of its card} from the governor at `path`, in its order.
+def resolve_cards(cards, base_dir, where):
+    """{card name: absolute path of its card file}, in the order of `cards`.
 
-    Card paths are relative to the governor's directory.
+    `cards` maps each card name to its file, relative to `base_dir` (global.yaml's
+    `cards:`, relative to the analysis). `where` names the mapping in error messages.
+    A name must be usable as a directory name, a file must exist, and two names cannot
+    point to the same file.
     """
-    path = os.path.abspath(path)
-    data = _read_yaml(path)
-    unknown = sorted(k for k in data if k != GOVERNOR_KEY)
-    if unknown:
-        raise CardConfigError(
-            f"{path}: a governor only lists `{GOVERNOR_KEY}:`; it does not take "
-            f"{', '.join(unknown)}"
-            + (
-                " (is this a card? point StatInference's `config:` at it instead)"
-                if any(k in data for k in ("model", "processes", "eras"))
-                else ""
-            )
-        )
-    cards = data.get(GOVERNOR_KEY)
     if not isinstance(cards, dict) or not cards:
-        raise CardConfigError(
-            f"{path}: `{GOVERNOR_KEY}:` must map each card name to its file"
-        )
-    base = os.path.dirname(path)
+        raise CardConfigError(f"{where} must map each card name to its file")
     result, seen = {}, {}
     for name, card in cards.items():
         name = str(name)
         if not _CARD_NAME.match(name):
             raise CardConfigError(
-                f"{path}: card name '{name}' is used as a directory name; use letters, "
+                f"{where}: card name '{name}' is used as a directory name; use letters, "
                 "digits, '_', '-' and '.' only"
             )
         if not isinstance(card, str):
-            raise CardConfigError(f"{path}: card '{name}' must name one file")
-        card_path = os.path.normpath(os.path.join(base, card))
+            raise CardConfigError(f"{where}: card '{name}' must name one file")
+        card_path = os.path.normpath(os.path.join(base_dir, card))
         real = os.path.realpath(card_path)
         if real in seen:
             raise CardConfigError(
-                f"{path}: cards '{seen[real]}' and '{name}' are the same file {card}"
+                f"{where}: cards '{seen[real]}' and '{name}' are the same file {card}"
             )
         if not os.path.isfile(card_path):
-            raise CardConfigError(f"{path}: card '{name}': no such file {card_path}")
+            raise CardConfigError(f"{where}: card '{name}': no such file {card_path}")
         seen[real] = name
         result[name] = card_path
     return result
 
 
 def card_name_of(path):
-    """The name a lone card goes by when no governor names it: its file name without
+    """The name a lone card (StatInference `config:`) goes by: its file name without
     the extension."""
     return os.path.splitext(os.path.basename(path))[0]
 

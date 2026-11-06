@@ -12,7 +12,7 @@ from StatInference.common.card_config import (
     card_name_of,
     dump_card_config,
     load_card_config,
-    load_governor,
+    resolve_cards,
 )
 
 
@@ -21,9 +21,9 @@ class StatInferenceTask(Task):
 
     Everything downstream of the merged histograms -- rebinning, datacards, limits, limit
     plots -- is driven by the datacard cards global.yaml's ``StatInference`` block names,
-    not by global.yaml's own variable lists: either ``governor:``, a file listing the
-    cards by name (see StatInference/common/card_config.py), or ``config:``, a single
-    card, which then goes by its file name. This base class is the single place those
+    not by global.yaml's own variable lists: either ``cards:``, mapping each card's name
+    to its file (see StatInference/common/card_config.py), or ``config:``, a single card,
+    which then goes by its file name. This base class is the single place those
     files are read, so the tasks below cannot disagree about which cards, eras, masses or
     variables the analysis consists of.
 
@@ -85,30 +85,32 @@ class StatInferenceTask(Task):
             lambda setup: setup.global_params["StatInference"], "StatInference"
         )
 
-    def governor_path(self):
-        """The file naming the cards: the governor, or the single card of `config:`."""
-        settings = self.statinference_settings()
-        governor, config = settings.get("governor"), settings.get("config")
-        if governor and config:
-            raise CardConfigError(
-                "global.yaml's StatInference block sets both `governor:` and `config:`; "
-                "set `governor:` to build the cards it lists, or `config:` for one card"
-            )
-        if not (governor or config):
-            raise CardConfigError(
-                "global.yaml's StatInference block sets neither `governor:` nor `config:`"
-            )
-        return os.path.join(self.ana_path(), governor or config)
+    #: how error messages name the list of cards
+    CARDS_SOURCE = "global.yaml's StatInference `cards:`"
 
     def datacard_cards(self):
-        """{card name: card file}, in the governor's order."""
+        """{card name: card file}: the StatInference block's `cards:`, in its order
+        (files relative to the analysis), or its single card `config:`, named after its
+        file. Setting both is ambiguous and raises."""
         if getattr(self, "_datacard_cards", None) is None:
             settings = self.statinference_settings()
-            if settings.get("governor"):
-                self._datacard_cards = load_governor(self.governor_path())
-            else:
-                path = self.governor_path()
+            cards, config = settings.get("cards"), settings.get("config")
+            if cards and config:
+                raise CardConfigError(
+                    "global.yaml's StatInference block sets both `cards:` and `config:`; "
+                    "set `cards:` to build the cards it lists, or `config:` for one card"
+                )
+            if cards:
+                self._datacard_cards = resolve_cards(
+                    cards, self.ana_path(), self.CARDS_SOURCE
+                )
+            elif config:
+                path = os.path.join(self.ana_path(), config)
                 self._datacard_cards = {card_name_of(path): path}
+            else:
+                raise CardConfigError(
+                    "global.yaml's StatInference block sets neither `cards:` nor `config:`"
+                )
         return self._datacard_cards
 
     def card_names(self):
@@ -121,14 +123,14 @@ class StatInferenceTask(Task):
         if not card:
             if len(cards) != 1:
                 raise ValueError(
-                    f"{self.get_task_family()}: {self.governor_path()} lists the cards "
-                    f"{', '.join(cards)}; name one"
+                    f"{self.get_task_family()}: {self.CARDS_SOURCE} lists the cards "
+                    f"{', '.join(cards)}; name one with --card"
                 )
             (card,) = cards
         if card not in cards:
             raise ValueError(
-                f"{self.get_task_family()}: no card '{card}' in {self.governor_path()} "
-                f"(its cards: {', '.join(cards)})"
+                f"{self.get_task_family()}: no card '{card}' in {self.CARDS_SOURCE} "
+                f"(the cards: {', '.join(cards)})"
             )
         return card
 
@@ -236,8 +238,7 @@ class StatInferenceTask(Task):
         if missing:
             needed = sorted({era for absent in missing.values() for era in absent})
             raise ValueError(
-                f"{self.get_task_family()}(era={era_csv(self.era)}): the cards of "
-                f"{self.governor_path()} need "
+                f"{self.get_task_family()}(era={era_csv(self.era)}): the cards need "
                 + "; ".join(
                     f"{card} {card_era}: {', '.join(absent)}"
                     for (card, card_era), absent in missing.items()
@@ -400,7 +401,7 @@ class CardTask(StatInferenceTask):
 
     card = luigi.Parameter(
         default="",
-        description="the card (a name in the governor) to run for; empty: every card",
+        description="the card (a name in StatInference's `cards:`) to run for; empty: every card",
     )
 
     def __init__(self, *args, **kwargs):

@@ -28,7 +28,7 @@ class PreprocessShapesTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflo
     is reading preprocessed shapes or raw ones.
 
     One branch per card and era -- branch data {"card": card, "era": era}, card by card
-    in the governor's order, each card's eras in the order of its `eras:` -- for the cards
+    in the order of `cards:`, each card's eras in the order of its `eras:` -- for the cards
     that declare a `preprocess:` step. CreateDatacardsTask's branches of a card and era
     require the branch of the same card and era here. The script is given the card as one
     merged file (see StatInferenceTask.write_merged_card), which is also kept in the

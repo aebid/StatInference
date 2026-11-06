@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Datacard configurations: cards with includes, and the governor listing the cards.
+"""Datacard configurations: cards with includes, and the list of cards to build.
 
 * load_card_config(): a card without `include:` reads exactly as yaml.safe_load() reads it.
   With includes, the files merge in order (includes, then the card): named lists are joined,
@@ -8,12 +8,13 @@
   name defined twice (across files or within one), an unnamed entry in a card with
   includes, an include that includes, is included twice, is the card itself or is missing.
   Include paths are relative to the including file.
-* load_governor(): {card name: file}, in order, file paths relative to the governor; an
-  unknown key, a repeated file, a name unfit for a directory, a missing card raise.
-* The law chain over a governor of two cards -- one plain, one split with an include, with
-  different eras and only one of them preprocessed -- has a branch per card, era and
-  mass; each card's outputs live under its name; the per-card tasks without --card stand
-  for every card; an unknown card and a block setting both `governor:` and `config:` raise.
+* resolve_cards(): {card name: file}, in order, file paths relative to the base directory;
+  a repeated file, a name unfit for a directory, a missing card, no cards raise.
+* The law chain over global.yaml's StatInference `cards:` of two cards -- one plain, one
+  split with an include, with different eras and only one of them preprocessed -- has a
+  branch per card, era and mass; each card's outputs live under its name; the per-card
+  tasks without --card stand for every card; an unknown card and a block setting both
+  `cards:` and `config:` raise.
 """
 
 import os
@@ -36,7 +37,7 @@ from StatInference.common.card_config import (  # noqa: E402
     dump_card_config,
     load_card_config,
     load_card_config_with_sources,
-    load_governor,
+    resolve_cards,
 )
 
 
@@ -227,12 +228,6 @@ class Merging(FilesTestCase):
             lambda: load_card_config(card), "common.yaml: no such file"
         )
 
-    def test_a_governor_is_not_a_card(self):
-        card = self.file("governor.yaml", "cards:\n  a: a.yaml\n")
-        self.assert_raises_naming(
-            lambda: load_card_config(card), "belongs to a governor"
-        )
-
     def test_the_dump_reads_back_as_the_merged_card(self):
         self.file("common.yaml", COMMON)
         card = self.file("spin0.yaml", SPIN0)
@@ -252,48 +247,35 @@ class Merging(FilesTestCase):
         )
 
 
-class Governor(FilesTestCase):
-    def test_the_cards_in_order_relative_to_the_governor(self):
+class Cards(FilesTestCase):
+    def resolve(self, cards):
+        return resolve_cards(cards, self.tmp, "StatInference `cards:`")
+
+    def test_the_cards_in_order_relative_to_the_base(self):
         a = self.file("Datacards/DL/a.yaml", "analysis: a\n")
         b = self.file("Datacards/b.yaml", "analysis: b\n")
-        governor = self.file(
-            "Datacards/governor.yaml", "cards:\n  DL_b: b.yaml\n  DL_a: DL/a.yaml\n"
-        )
-        self.assertEqual(
-            list(load_governor(governor).items()), [("DL_b", b), ("DL_a", a)]
-        )
-
-    def test_a_governor_lists_cards_only(self):
-        self.file("a.yaml", "analysis: a\n")
-        governor = self.file(
-            "governor.yaml", "cards:\n  a: a.yaml\neras: [ Run3_2022 ]\n"
-        )
-        self.assert_raises_naming(
-            lambda: load_governor(governor), "does not take eras", "is this a card?"
-        )
+        cards = {"DL_b": "Datacards/b.yaml", "DL_a": "Datacards/DL/a.yaml"}
+        self.assertEqual(list(self.resolve(cards).items()), [("DL_b", b), ("DL_a", a)])
 
     def test_the_same_file_twice_raises(self):
         self.file("a.yaml", "analysis: a\n")
-        governor = self.file("governor.yaml", "cards:\n  a: a.yaml\n  b: ./a.yaml\n")
         self.assert_raises_naming(
-            lambda: load_governor(governor), "'a' and 'b' are the same file"
+            lambda: self.resolve({"a": "a.yaml", "b": "./a.yaml"}),
+            "'a' and 'b' are the same file",
         )
 
     def test_a_card_name_must_be_a_directory_name(self):
         self.file("a.yaml", "analysis: a\n")
-        governor = self.file("governor.yaml", "cards:\n  a/b: a.yaml\n")
-        self.assert_raises_naming(lambda: load_governor(governor), "'a/b'")
+        self.assert_raises_naming(lambda: self.resolve({"a/b": "a.yaml"}), "'a/b'")
 
     def test_a_missing_card_raises(self):
-        governor = self.file("governor.yaml", "cards:\n  a: a.yaml\n")
-        self.assert_raises_naming(lambda: load_governor(governor), "no such file")
+        self.assert_raises_naming(lambda: self.resolve({"a": "a.yaml"}), "no such file")
 
     def test_no_cards_raises(self):
-        governor = self.file("governor.yaml", "cards: {}\n")
-        self.assert_raises_naming(lambda: load_governor(governor), "must map")
+        self.assert_raises_naming(lambda: self.resolve({}), "must map")
 
 
-VERSION = "v_governor"
+VERSION = "v_cards"
 HISTS_VERSION = "v_hists"
 
 #: card "B": the fixture card's settings minus its eras and processes, in a shared file,
@@ -315,23 +297,27 @@ processes:
     is_signal: true
   - TT
 """
-GOVERNOR = "cards:\n  A: card_preprocess.yaml\n  B: B/card_b.yaml\n"
+#: the StatInference block's cards, relative to the analysis
+CARDS = (
+    "cards:\n"
+    "    A: config/Datacards/card_preprocess.yaml\n"
+    "    B: config/Datacards/B/card_b.yaml"
+)
 
-#: (card, era) of every card's eras, in the governor's order
+#: (card, era) of every card's eras, in the order of `cards:`
 CARD_ERAS = [("A", era) for era in fx.CARD_ERAS] + [("B", fx.ERA_C)]
 
 
-class GovernorChain(unittest.TestCase):
-    statinference = "governor: config/Datacards/governor.yaml"
+class CardsChain(unittest.TestCase):
+    statinference = CARDS
 
     @classmethod
     def setUpClass(cls):
-        cls.tmp = tempfile.mkdtemp(prefix="statinference_governor_")
+        cls.tmp = tempfile.mkdtemp(prefix="statinference_cards_")
         cls.ana = fx.make_analysis(cls.tmp, "config/Datacards/card.yaml")
         datacards = os.path.join(cls.ana, "config", "Datacards")
         fx.write(os.path.join(datacards, "shared.yaml"), SHARED)
         fx.write(os.path.join(datacards, "B", "card_b.yaml"), CARD_B)
-        fx.write(os.path.join(datacards, "governor.yaml"), GOVERNOR)
         global_yaml = os.path.join(cls.ana, "config", "global.yaml")
         with open(global_yaml) as f:
             text = f.read()
@@ -468,15 +454,12 @@ class GovernorChain(unittest.TestCase):
         self.assertIn(f"B {fx.ERA_C}: {fx.ERA_C}", str(raised.exception))
 
 
-class GovernorAndConfig(unittest.TestCase):
+class CardsAndConfig(unittest.TestCase):
     """Both keys at once: which cards are meant is ambiguous."""
 
     def test_both_raise(self):
-        class Both(GovernorChain):
-            statinference = (
-                "governor: config/Datacards/governor.yaml\n"
-                "  config: config/Datacards/card.yaml"
-            )
+        class Both(CardsChain):
+            statinference = CARDS + "\n  config: config/Datacards/card.yaml"
 
         Both.setUpClass()
         try:
@@ -486,7 +469,7 @@ class GovernorAndConfig(unittest.TestCase):
             )
             with self.assertRaises(CardConfigError) as raised:
                 task.get_branch_map()
-            self.assertIn("sets both `governor:` and `config:`", str(raised.exception))
+            self.assertIn("sets both `cards:` and `config:`", str(raised.exception))
         finally:
             Both.tearDownClass()
 

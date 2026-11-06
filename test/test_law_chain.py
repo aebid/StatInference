@@ -7,7 +7,7 @@ Run3_2023; Run3_2022EE reads its histograms from a store of its own), with and w
 `preprocess:` step:
 
 The configuration is one plain card (global.yaml's `config:`), which goes by its file name;
-several cards through a governor are covered by test_card_config.py.
+several cards (`cards:`) are covered by test_card_config.py.
 
 * one branch per card era the configuration lists and mass point, written to
   `<fs_default>/<v>/Datacards/<card>/<era>/MX_<mass>` by the card's payload for that mass

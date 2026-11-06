@@ -20,8 +20,8 @@ from .StatInferenceTask import StatInferenceTask
 
 class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow):
     """The datacards of the configuration, one branch per card, era and mass point:
-    branch data {"card": card, "era": era, "mass": value}, card by card in the governor's
-    order, each card's eras in the order of its `eras:`.
+    branch data {"card": card, "era": era, "mass": value}, card by card in the order of
+    `cards:`, each card's eras in the order of its `eras:`.
 
     Runs dc_make/create_datacards.py for one mass on whatever `<era>/<variable>/<variable>.root`
     tree it is given -- the configuration's `preprocess:` step if it declares one, otherwise

@@ -27,27 +27,34 @@ class PreprocessShapesTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflo
     already look like. That is the whole contract: the datacard step cannot tell whether it
     is reading preprocessed shapes or raw ones.
 
-    One branch per card of the configuration, in the order of its `eras:`, as
-    CreateDatacardsTask, whose branch of a card requires the branch of the same card here.
+    One branch per card and era -- branch data {"card": card, "era": era}, card by card
+    in the governor's order, each card's eras in the order of its `eras:` -- for the cards
+    that declare a `preprocess:` step. CreateDatacardsTask's branches of a card and era
+    require the branch of the same card and era here. The script is given the card as one
+    merged file (see StatInferenceTask.write_merged_card), which is also kept in the
+    output.
     """
 
     max_runtime = copy_param(HTCondorWorkflow.max_runtime, 4.0)
     n_cpus = copy_param(HTCondorWorkflow.n_cpus, 1)
 
-    def input_hist_reqs(self, card_eras):
-        return {
-            f"MergedHists_{era}_{variable}": req
+    def input_hist_reqs(self, branches):
+        """{key: MergedHists} of the branches (card, era) `branches`, each file once."""
+        reqs = {}
+        for data in branches:
+            card = data["card"]
             for (era, variable), req in self.merged_hist_reqs(
-                self.sub_eras_of(card_eras)
-            ).items()
-        }
+                self.sub_eras_of([data["era"]], card), card
+            ).items():
+                reqs.setdefault(f"MergedHists_{era}_{variable}", req)
+        return reqs
 
     def stage_workflow_requires(self):
         # Merged with the base class's rather than replacing them: FLAF's HTCondorWorkflow
         # puts the software bundles a submitted job unpacks in there, and returning only
         # our own inputs drops them, so the jobs start without the bundle they need.
         reqs = super().stage_workflow_requires()
-        # the selected cards only (the map honours --branches)
+        # the selected branches only (the map honours --branches)
         reqs.update(self.input_hist_reqs(self.get_branch_map().values()))
         return reqs
 
@@ -55,33 +62,45 @@ class PreprocessShapesTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflo
         return list(self.input_hist_reqs([self.branch_data]).values())
 
     def create_branch_map(self):
-        return dict(enumerate(self.card_eras()))
+        return dict(
+            enumerate(
+                {"card": card, "era": era}
+                for card, era in self.card_eras()
+                if self.preprocess_config(card)
+            )
+        )
 
     def output(self):
         return self.output_dir_target(
-            self.version, "Hists_preprocessed", self.branch_data
+            self.version,
+            "Hists_preprocessed",
+            self.branch_data["card"],
+            self.branch_data["era"],
         )
 
     def run(self):
-        cfg = self.preprocess_config()
+        card, card_era = self.branch_data["card"], self.branch_data["era"]
+        cfg = self.preprocess_config(card)
         if not cfg:
             raise RuntimeError(
-                f"{self.datacard_config_path()} declares no 'preprocess' block, so this "
-                "task has nothing to run. CreateDatacardsTask reads the merged histograms "
-                "directly in that case and does not require it."
+                f"{self.datacard_config_path(card)} declares no 'preprocess' block, so "
+                "this task has nothing to run. CreateDatacardsTask reads the merged "
+                "histograms directly in that case and does not require it."
             )
         script = os.path.join(self.ana_path(), cfg["script"])
-        card_era = self.branch_data
         with contextlib.ExitStack() as stack:
             targets = {
                 key: req.output()
                 for key, req in self.merged_hist_reqs(
-                    self.get_sub_eras(card_era)
+                    self.get_sub_eras(card_era, card), card
                 ).items()
             }
             self.check_inputs(targets)
             base_dir_local = stack.enter_context(self.stage_inputs(targets))
             local_output = stack.enter_context(self.output().localize("w"))
+            merged_card = self.write_merged_card(
+                card, os.path.join(local_output.abspath, self.MERGED_CARD_FILE)
+            )
             cmd = [
                 "python3",
                 "-u",
@@ -93,7 +112,7 @@ class PreprocessShapesTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflo
                 "--era",
                 card_era,
                 "--config",
-                self.datacard_config_path(),
+                merged_card,
             ]
             # ${ERA} in an argument names the era being produced, the same way the model's
             # input_file_pattern does. An argument beginning with "config/" is resolved

@@ -6,15 +6,19 @@ card Run3_Early = Run3_2022 + Run3_2022EE, a card for its member Run3_2022 and o
 Run3_2023; Run3_2022EE reads its histograms from a store of its own), with and without a
 `preprocess:` step:
 
+The configuration is one plain card (global.yaml's `config:`), which goes by its file name;
+several cards through a governor are covered by test_card_config.py.
+
 * one branch per card era the configuration lists and mass point, written to
-  `<fs_default>/<v>/Datacards/<card>/MX_<mass>` by the card's payload for that mass alone;
+  `<fs_default>/<v>/Datacards/<card>/<era>/MX_<mass>` by the card's payload for that mass
+  alone, which reads the card as the one merged file it keeps in its output;
 * the merged histograms a card reads are its sub-eras' variables, each from its own era's
   `fs_HistTuple` under --hists-version, required by the card and by its workflow; with
   `preprocess:` the card reads the preprocessed shapes
-  `<fs_default>/<v>/Hists_preprocessed/<card>`, which are built from that same set; a
+  `<fs_default>/<v>/Hists_preprocessed/<card>/<era>`, which are built from that same set; a
   missing one is named;
-* ResonantLimitsTask writes `limits.npz`, `era_limits/` and `Datacards/combined` where it
-  always has, mirrors every mass of a card into the one `Datacards/<card>`, merges each
+* ResonantLimitsTask writes `limits.npz`, `era_limits/` and `Datacards/<card>/combined`,
+  mirrors every mass of a card era into the one `Datacards/<card>/<era>`, merges each
   card's limits on their own and combines only the top-level cards (the group, not its
   member);
 * ResonantLimitsAndHistPlotTask requires the HistPlots of every real era behind the cards,
@@ -42,6 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import statinference_fixture as fx  # noqa: E402
 
 import luigi  # noqa: E402
+import yaml  # noqa: E402
 
 VERSION = "v_chain"
 HISTS_VERSION = "v_hists"
@@ -153,6 +158,20 @@ class ChainTestCase(unittest.TestCase):
     def store(self, *path):
         return os.path.join(self.tmp, "store", *path)
 
+    @property
+    def card_name(self):
+        """A plain card goes by its file name."""
+        return os.path.splitext(os.path.basename(self.card_file))[0]
+
+    def assert_merged_card(self, path, output_dir):
+        """`path` is the merged card the payload was given, kept in its output
+        `output_dir`: the card file, as read."""
+        self.assertEqual(os.path.basename(path), "card_config.yaml")
+        with open(os.path.join(output_dir, "card_config.yaml")) as f:
+            given = yaml.safe_load(f)
+        with open(os.path.join(self.ana, self.card_file)) as f:
+            self.assertEqual(given, yaml.safe_load(f))
+
     def merged_hist(self, era, variable):
         return os.path.join(
             self.tmp,
@@ -240,7 +259,14 @@ class PlainChainTest(ChainTestCase):
         for (card_era, mass), card in cards_of(limits_task()).items():
             self.assertEqual(
                 card.output().abspath,
-                self.store("default", VERSION, "Datacards", card_era, f"MX_{mass}"),
+                self.store(
+                    "default",
+                    VERSION,
+                    "Datacards",
+                    self.card_name,
+                    card_era,
+                    f"MX_{mass}",
+                ),
             )
 
     def test_card_inputs_are_the_sub_eras_merged_histograms(self):
@@ -264,22 +290,24 @@ class PlainChainTest(ChainTestCase):
     def test_limit_outputs(self):
         limits = limits_task()
         data = os.path.join(self.tmp, "data", VERSION)
+        card = self.card_name
         outputs = limits.output()
         self.assertEqual(
             outputs["limits"].abspath,
-            os.path.join(data, "ResonantLimitsTask", "combined", "limits.npz"),
+            os.path.join(data, "ResonantLimitsTask", card, "combined", "limits.npz"),
         )
         self.assertEqual(
             outputs["era_limits"].abspath,
-            os.path.join(data, "ResonantLimitsTask", "combined", "era_limits"),
+            os.path.join(data, "ResonantLimitsTask", card, "combined", "era_limits"),
         )
         self.assertEqual(
-            outputs["datacards"].abspath, os.path.join(data, "Datacards", "combined")
+            outputs["datacards"].abspath,
+            os.path.join(data, "Datacards", card, "combined"),
         )
         for card_era in fx.CARD_ERAS:
             self.assertEqual(
                 limits.datacards_dir(card_era),
-                os.path.join(data, "Datacards", card_era),
+                os.path.join(data, "Datacards", card, card_era),
             )
 
     def test_limits_merge_each_card_and_combine_the_top_level_ones(self):
@@ -293,6 +321,7 @@ class PlainChainTest(ChainTestCase):
                     "default",
                     VERSION,
                     "Datacards",
+                    self.card_name,
                     card_era,
                     f"MX_{mass}",
                     f"datacard_{card_era}_{mass}.txt",
@@ -338,7 +367,9 @@ class PlainChainTest(ChainTestCase):
             for path in paths:
                 with open(path) as f:
                     self.assertEqual(f.read(), card_era)
-        combined = os.path.join(self.tmp, "data", VERSION, "Datacards", "combined")
+        combined = os.path.join(
+            self.tmp, "data", VERSION, "Datacards", self.card_name, "combined"
+        )
         self.assertEqual(
             merges,
             {
@@ -392,9 +423,8 @@ class PlainChainTest(ChainTestCase):
                     ),
                 )
                 self.assertEqual(self.arg(cmd, "--eras"), card_era)
-                self.assertEqual(
-                    self.arg(cmd, "--config"),
-                    os.path.join(ana, "config", "Datacards", "card.yaml"),
+                self.assert_merged_card(
+                    self.arg(cmd, "--config"), card.output().abspath
                 )
                 self.assertEqual(
                     self.arg(cmd, "--hist-bins"),
@@ -404,7 +434,10 @@ class PlainChainTest(ChainTestCase):
                 self.assertEqual(self.arg(cmd, "--param_values"), str(mass))
                 self.assertEqual(env, {"CMSSW_ENV": "1"})
                 self.assertEqual(files, self.staged_layout(card_era, mass))
-                self.assertIn("payload_output", os.listdir(card.output().abspath))
+                self.assertEqual(
+                    set(os.listdir(card.output().abspath)) - {"plots"},
+                    {"payload_output", "card_config.yaml"},
+                )
 
                 # the variable of this mass only
                 (plot,) = [c[0] for c in calls if "--all_keys" in c[0]]
@@ -472,8 +505,13 @@ class PreprocessChainTest(ChainTestCase):
             # every mass of a card reads the one preprocessing branch of that card
             self.assertEqual(preprocess.branch, fx.CARD_ERAS.index(card_era))
             self.assertEqual(
+                preprocess.branch_data, {"card": self.card_name, "era": card_era}
+            )
+            self.assertEqual(
                 preprocess.output().abspath,
-                self.store("default", VERSION, "Hists_preprocessed", card_era),
+                self.store(
+                    "default", VERSION, "Hists_preprocessed", self.card_name, card_era
+                ),
             )
             reqs = luigi.task.flatten(preprocess.requires())
             self.assertTrue(all(isinstance(r, fx.si.MergedHists) for r in reqs))
@@ -518,9 +556,8 @@ class PreprocessChainTest(ChainTestCase):
                     ],
                 )
                 self.assertEqual(self.arg(cmd, "--era"), card_era)
-                self.assertEqual(
-                    self.arg(cmd, "--config"),
-                    os.path.join(ana, "config", "Datacards", "card_preprocess.yaml"),
+                self.assert_merged_card(
+                    self.arg(cmd, "--config"), preprocess.output().abspath
                 )
                 self.assertEqual(
                     self.arg(cmd, "--binning-config"),
@@ -531,7 +568,10 @@ class PreprocessChainTest(ChainTestCase):
                 self.assertEqual(self.arg(cmd, "--tag"), card_era)
                 self.assertEqual(env, {"CMSSW_ENV": "1"})
                 self.assertEqual(files, self.staged_layout(card_era))
-                self.assertIn("payload_output", os.listdir(preprocess.output().abspath))
+                self.assertEqual(
+                    set(os.listdir(preprocess.output().abspath)),
+                    {"payload_output", "card_config.yaml"},
+                )
 
     def test_create_datacards_reads_the_preprocessed_shapes(self):
         for (card_era, mass), card in cards_of(limits_task()).items():

@@ -159,7 +159,9 @@ class ShapePlotsTest(unittest.TestCase):
             branch=MASSES.index(mass),
             **params,
         )
-        self.assertEqual(card.branch_data, {"era": fx.ERA_A, "mass": mass})
+        self.assertEqual(
+            card.branch_data, {"card": "card_sl", "era": fx.ERA_A, "mass": mass}
+        )
         return card
 
     def plot(self, card, directories_of, root=None):

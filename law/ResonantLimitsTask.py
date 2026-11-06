@@ -1,3 +1,4 @@
+import filecmp
 import glob
 import law
 import luigi
@@ -9,7 +10,7 @@ import tempfile
 
 from dhi.tasks.resonant import MergeResonantLimits
 
-from .StatInferenceTask import StatInferenceTask
+from .StatInferenceTask import CardTask
 from .CreateDatacardsTask import CreateDatacardsTask
 
 # Key for the cross-era merge in run()'s dynamic-dependency dict. Not an era name,
@@ -17,7 +18,11 @@ from .CreateDatacardsTask import CreateDatacardsTask
 COMBINED_KEY = "__combined__"
 
 
-class ResonantLimitsTask(StatInferenceTask):
+class ResonantLimitsTask(CardTask):
+    """The limits of one card (`--card`): each of its eras', and the combination of its
+    top-level eras. Without `--card`, the limits of every card (see CardTask).
+    """
+
     # Not a workflow itself. The parameter exists so that --workflow reaches the tasks
     # below that are -- law's req() only forwards parameters both tasks declare -- and
     # NO_STR leaves each of those at its own default.
@@ -26,17 +31,25 @@ class ResonantLimitsTask(StatInferenceTask):
     check_card_eras = True
 
     def store_parts(self):
-        return (self.version, self.__class__.__name__, "combined")
+        return super().store_parts() + ("combined",)
 
     def requires(self):
+        if self.all_cards:
+            return self.card_tasks()
+        # Every card's datacards, as one workflow: the jobs of a version are one set
+        # whichever card's limits ask for them.
         return CreateDatacardsTask.req(self, branches=())
 
     def era_card_outputs(self):
-        """{card era: [the outputs of the branches that write that card's masses]}, each
-        era's in increasing mass, so staging them is deterministic."""
+        """{era: [the outputs of the branches that write this card's masses of that
+        era]}, each era's in increasing mass, so staging them is deterministic."""
         outputs = {}
         tasks = sorted(
-            self.requires().get_branch_tasks().values(),
+            (
+                task
+                for task in self.requires().get_branch_tasks().values()
+                if task.branch_data["card"] == self.this_card
+            ),
             key=lambda task: float(task.branch_data["mass"]),
         )
         for task in tasks:
@@ -44,6 +57,8 @@ class ResonantLimitsTask(StatInferenceTask):
         return outputs
 
     def output(self):
+        if self.all_cards:
+            return {card: task.output() for card, task in self.card_tasks().items()}
         return {
             # The limit of the combination this configuration is about: the single
             # top-level era's own, or the cross-era combined cards' when it lists
@@ -101,6 +116,10 @@ class ResonantLimitsTask(StatInferenceTask):
     def _merge_mass_dir(src, dest, mass_dir):
         """Copy one mass's output `src` into the era's `dest`: plots/ to plots/<mass_dir>/,
         everything else to the same relative path, raising if that path already exists.
+
+        The one exception is the merged card every mass keeps (MERGED_CARD_FILE): all
+        masses of a card are built from the same one, so it is kept once -- and it still
+        raises if two masses' copies differ.
         """
         for root, _, files in os.walk(src):
             rel = os.path.relpath(root, src)
@@ -112,6 +131,12 @@ class ResonantLimitsTask(StatInferenceTask):
             for name in files:
                 target = os.path.join(target_dir, name)
                 if os.path.lexists(target):
+                    if (
+                        not parts
+                        and name == CardTask.MERGED_CARD_FILE
+                        and filecmp.cmp(os.path.join(root, name), target, shallow=False)
+                    ):
+                        continue
                     raise RuntimeError(
                         f"staging {mass_dir} into {dest}: {os.path.join(*parts, name)} "
                         "was already written by another mass point"
@@ -119,6 +144,9 @@ class ResonantLimitsTask(StatInferenceTask):
                 shutil.copy2(os.path.join(root, name), target)
 
     def run(self):
+        if self.all_cards:
+            # every card's limits are its requirements; nothing is left to do here
+            return
         era_cards = {}
 
         for e, card_output in self.era_card_outputs().items():

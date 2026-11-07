@@ -13,8 +13,8 @@
 * The law chain over global.yaml's StatInference `cards:` of two cards -- one plain, one
   split with an include, with different eras and only one of them preprocessed -- has a
   branch per card, era and mass; each card's outputs live under its name; the per-card
-  tasks without --card stand for every card; an unknown card and a block setting both
-  `cards:` and `config:` raise.
+  tasks without --card stand for every card; an unknown card, a block setting both
+  `cards:` and `config:` (also when one is empty), and an empty `cards:` or `config:` raise.
 """
 
 import os
@@ -454,14 +454,16 @@ class CardsChain(unittest.TestCase):
         self.assertIn(f"B {fx.ERA_C}: {fx.ERA_C}", str(raised.exception))
 
 
-class CardsAndConfig(unittest.TestCase):
-    """Both keys at once: which cards are meant is ambiguous."""
+class AmbiguousStatInferenceBlock(unittest.TestCase):
+    """The cards are chosen by which keys the block sets, not by their values: an empty
+    `cards:` is reported, never read as unset."""
 
-    def test_both_raise(self):
-        class Both(CardsChain):
-            statinference = CARDS + "\n  config: config/Datacards/card.yaml"
+    def error(self, statinference):
+        class Block(CardsChain):
+            pass
 
-        Both.setUpClass()
+        Block.statinference = statinference
+        Block.setUpClass()
         try:
             fx.clear_process_caches()
             task = fx.si.CreateDatacardsTask(
@@ -469,9 +471,29 @@ class CardsAndConfig(unittest.TestCase):
             )
             with self.assertRaises(CardConfigError) as raised:
                 task.get_branch_map()
-            self.assertIn("sets both `cards:` and `config:`", str(raised.exception))
+            return str(raised.exception)
         finally:
-            Both.tearDownClass()
+            Block.tearDownClass()
+
+    def test_both_raise(self):
+        self.assertIn(
+            "sets both `cards:` and `config:`",
+            self.error(CARDS + "\n  config: config/Datacards/card.yaml"),
+        )
+
+    def test_an_empty_cards_next_to_config_still_raises(self):
+        self.assertIn(
+            "sets both `cards:` and `config:`",
+            self.error("cards: {}\n  config: config/Datacards/card.yaml"),
+        )
+
+    def test_an_empty_cards_raises(self):
+        for empty in ("cards: {}", "cards:"):
+            with self.subTest(empty=empty):
+                self.assertIn("must map each card name to its file", self.error(empty))
+
+    def test_an_empty_config_raises(self):
+        self.assertIn("`config:` must name one card file", self.error('config: ""'))
 
 
 if __name__ == "__main__":

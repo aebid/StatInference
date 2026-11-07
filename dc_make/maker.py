@@ -1,7 +1,6 @@
 import itertools
 import math
 import os
-import yaml
 
 from CombineHarvester.CombineTools.ch import CombineHarvester
 

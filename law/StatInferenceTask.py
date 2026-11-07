@@ -94,17 +94,23 @@ class StatInferenceTask(Task):
         file. Setting both is ambiguous and raises."""
         if getattr(self, "_datacard_cards", None) is None:
             settings = self.statinference_settings()
-            cards, config = settings.get("cards"), settings.get("config")
-            if cards and config:
+            # By key, not by value: an empty `cards:` is a mistake to report, not "unset".
+            has_cards, has_config = "cards" in settings, "config" in settings
+            if has_cards and has_config:
                 raise CardConfigError(
                     "global.yaml's StatInference block sets both `cards:` and `config:`; "
                     "set `cards:` to build the cards it lists, or `config:` for one card"
                 )
-            if cards:
+            if has_cards:
                 self._datacard_cards = resolve_cards(
-                    cards, self.ana_path(), self.CARDS_SOURCE
+                    settings["cards"], self.ana_path(), self.CARDS_SOURCE
                 )
-            elif config:
+            elif has_config:
+                config = settings["config"]
+                if not isinstance(config, str) or not config:
+                    raise CardConfigError(
+                        "global.yaml's StatInference `config:` must name one card file"
+                    )
                 path = os.path.join(self.ana_path(), config)
                 self._datacard_cards = {card_name_of(path): path}
             else:

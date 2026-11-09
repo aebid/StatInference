@@ -97,6 +97,37 @@ E.g.
 rm -r output/binning_v2/tauTau_2018/workers
 ```
 
+## Datacard cards
+
+The chain builds the datacard *cards* the analysis's `global.yaml` names in its
+`StatInference` block: either `cards:`, each card's name and file (paths relative to the
+analysis), or `config:`, a single card, which then goes by its file name. Setting both is an
+error.
+
+```yaml
+StatInference:
+  cards:
+    DL_spin0: config/Datacards/DL/dl_spin0.yaml
+    DL_spin2: config/Datacards/DL/dl_spin2.yaml
+```
+
+The name is used for the law branches (`{card, era[, mass]}`), the output paths
+(`Datacards/<card>/<era>/...`, `ResonantLimitsTask/<card>/...`) and `--card` of the limit and
+plot tasks (without it they run every card); it does not appear in the datacards.
+
+A card can `include:` shared files, paths relative to the including file. The merge is strict
+and never overrides: `processes`, `uncertainties`, `limit_plots` and `impact_plots` are joined
+and an entry name defined twice raises; every other top-level key is set in one file only.
+Includes do not nest. A card without `include:` reads as before. To see a card merged, with the
+file each setting comes from:
+
+```bash
+python3 StatInference/common/card_config.py <card.yaml>
+```
+
+The chain hands its scripts (the preprocess step, `create_datacards.py`) the merged card as one
+file, `card_config.yaml`, kept next to their output. See `common/card_config.py` for the rules.
+
 ## Unit tests
 
 `test/test_law_chain.py` checks the law tasks on the real FLAF and law classes over a scratch
@@ -104,6 +135,8 @@ analysis (`test/statinference_fixture.py`): for each card, what it writes, which
 histograms it reads and the commands it runs. `test/test_card_eras.py` checks the card
 workflows over several eras, and `test/test_shape_plots.py` which histograms the shape plots
 of a card show, for categories read through `input_categories`.
+`test/test_card_config.py` checks the card loader's merge rules and a chain over several
+cards, one of them with an include (not yet in the `unit-tests` workflow's file list).
 They need no ROOT, Combine or dhi. The `unit-tests` workflow runs them against a pinned FLAF
 commit; to run them locally, put a FLAF checkout at that commit (`ref:` in
 `.github/workflows/unit-tests.yaml`) next to this one and run from the directory holding both:
@@ -111,5 +144,6 @@ commit; to run them locally, put a FLAF checkout at that commit (`ref:` in
 ```bash
 pip install pyyaml numpy luigi==3.8.1 law==0.1.21 pytest
 PYTHONPATH=$PWD python -m pytest -q StatInference/test/test_law_chain.py \
-    StatInference/test/test_card_eras.py StatInference/test/test_shape_plots.py
+    StatInference/test/test_card_eras.py StatInference/test/test_shape_plots.py \
+    StatInference/test/test_card_config.py
 ```

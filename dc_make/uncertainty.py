@@ -4,6 +4,7 @@ import re
 from enum import Enum
 
 from ..common.tools import importROOT
+from .member_reduction import MemberReduction
 
 ROOT = importROOT()
 
@@ -120,6 +121,11 @@ class Uncertainty:
         for key in ["processes", "eras", "channels", "categories"]:
             args[key] = getPatternList(key)
 
+        if "members" in entry and unc_type != UncertaintyType.shape:
+            raise RuntimeError(
+                f"Uncertainty {name}: members are reduced to a shape, so its type must be shape"
+            )
+
         if unc_type == UncertaintyType.lnN:
             value = entry.get("value")
             # print(value)
@@ -163,7 +169,10 @@ class Uncertainty:
             else:
                 raise RuntimeError("Invalid lnN uncertainty value")
         elif unc_type == UncertaintyType.shape:
-            unc = ShapeUncertainty(name, **args)
+            members = None
+            if "members" in entry:
+                members = MemberReduction.fromConfig(entry["members"], name)
+            unc = ShapeUncertainty(name, members=members, **args)
         elif unc_type == UncertaintyType.auto:
             unc = AutoUncertainty(name, **args)
         else:
@@ -330,6 +339,13 @@ class MultiValueLnNUncertainty(Uncertainty):
 
 
 class ShapeUncertainty(Uncertainty):
+    """A shape uncertainty: read as <process>_<name>_Up|Down, or, with `members`
+    (member_reduction.MemberReduction), reduced from a set of member histograms."""
+
+    def __init__(self, name, members=None, **kwargs):
+        super().__init__(name, **kwargs)
+        self.members = members
+
     @property
     def type(self):
         return UncertaintyType.shape

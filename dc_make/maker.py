@@ -706,6 +706,7 @@ class DatacardMaker:
         model_params,
         unc_name=None,
         unc_scale=None,
+        suffix=None,
     ):
         """One process's shape in one bin, as read, with no negative-bin validation.
 
@@ -715,7 +716,13 @@ class DatacardMaker:
         is fine. Validating per sub-era would reject shapes that are good, and would also
         change them: resolveNegativeBins rebalances in place, so clamping each sub-era and
         then summing does not give the same shape as summing and then clamping.
+
+        The histogram read is <process>_<variation>, the variation being `suffix` when
+        given (a member of a member uncertainty) and <unc_name>_<unc_scale> otherwise.
         """
+        variation = suffix
+        if variation is None and unc_name and unc_scale:
+            variation = f"{unc_name}_{unc_scale}"
         file_name, file = self.getInputFile(era, model_params)
         key = (
             file_name,
@@ -726,9 +733,13 @@ class DatacardMaker:
             unc_name,
             unc_scale,
         )
+        if suffix is not None:
+            key += ("member", suffix)
 
         if key not in self.shapes:
-            if process.is_data and (unc_name is not None or unc_scale is not None):
+            if process.is_data and (
+                unc_name is not None or unc_scale is not None or suffix is not None
+            ):
                 raise RuntimeError("Cannot apply uncertainty to the data process")
             if process.is_asimov_data:
                 hist = None
@@ -762,8 +773,8 @@ class DatacardMaker:
                 if process.subprocesses:
                     for subp in process.subprocesses:
                         hist_name = f"{hist_dir}/{subp}"
-                        if unc_name and unc_scale:
-                            hist_name += f"_{unc_name}_{unc_scale}"
+                        if variation:
+                            hist_name += f"_{variation}"
                         subhist = self.readHist(file, hist_name)
                         if subhist == None:
                             raise RuntimeError(
@@ -775,8 +786,8 @@ class DatacardMaker:
                             )
                         )
                 else:
-                    if unc_name and unc_scale:
-                        hist_name += f"_{unc_name}_{unc_scale}"
+                    if variation:
+                        hist_name += f"_{variation}"
                     hist = self.readHist(file, hist_name)
                     if hist == None:
                         raise RuntimeError(
@@ -798,7 +809,7 @@ class DatacardMaker:
                 if process.scale != 1:
                     hist.Scale(process.scale)
 
-                if process.is_signal and not (unc_name and unc_scale):
+                if process.is_signal and variation is None:
                     param_str = (
                         self.model.paramStr(model_params) if model_params else "*"
                     )
@@ -1123,6 +1134,105 @@ class DatacardMaker:
             )
         return unused
 
+    def getMemberShapes(
+        self, unc_name, process, era, channel, category, model_params, nominal_shape
+    ):
+        """{Up, Down} of a member uncertainty (ShapeUncertainty with `members`).
+
+        Every member is summed over the sub-eras of a meta-era (a sub-era the uncertainty
+        is not scoped to contributes its nominal) and reduced against the raw nominal,
+        summed the same way: the reduction is not linear, so it is taken on the shape
+        that enters the bin, never per sub-era. The reduced shift of each bin then moves
+        the validated nominal, so a nominal whose negative bins were rebalanced keeps
+        that, and Up and Down are validated like any other variation.
+        """
+        unc = self.uncertainties[unc_name]
+        members = unc.members
+        sub_eras = self.getSubEras(era) if self.isMetaEra(era) else [era]
+
+        def raw_sum(suffix):
+            total = None
+            for sub_era in sub_eras:
+                applies = suffix is not None and self.uncAppliesTo(
+                    unc, process, sub_era, channel, category
+                )
+                h = self._rawShape(
+                    process,
+                    sub_era,
+                    channel,
+                    category,
+                    model_params,
+                    suffix=suffix if applies else None,
+                )
+                if h is None:
+                    continue
+                if total is None:
+                    total = h.Clone()
+                    ROOT.SetOwnership(total, True)
+                else:
+                    total.Add(h)
+            return total
+
+        def contents(h):
+            return [h.GetBinContent(n) for n in range(1, h.GetNbinsX() + 1)]
+
+        nominal_raw = contents(raw_sum(None))
+        member_raw = {
+            m: contents(raw_sum(members.histogram_name(unc_name, process.hist_name, m)))
+            for m in members.all_members()
+        }
+        up, down = members.reduce(
+            nominal_raw,
+            member_raw,
+            label=f"{unc_name} {process.name} {era}/{channel}/{category}",
+        )
+        shapes = {}
+        for unc_scale, values in (
+            (UncertaintyScale.Up, up),
+            (UncertaintyScale.Down, down),
+        ):
+            hist = nominal_shape.Clone()
+            hist.SetDirectory(0)
+            ROOT.SetOwnership(hist, True)
+            for n in range(1, hist.GetNbinsX() + 1):
+                shift = values[n - 1] - nominal_raw[n - 1]
+                hist.SetBinContent(n, max(nominal_shape.GetBinContent(n) + shift, 0.0))
+            self.resolveOrRaiseNegativeBins(
+                hist,
+                process,
+                era,
+                channel,
+                category,
+                model_params,
+                unc_name,
+                unc_scale.name,
+                discovery_eras=sub_eras if self.isMetaEra(era) else None,
+            )
+            shapes[unc_scale] = hist
+        return shapes
+
+    def getVariedShapes(
+        self, unc_name, process, era, channel, category, model_params, nominal_shape
+    ):
+        """{Up, Down} shapes of a shape-needing uncertainty for one process and bin."""
+        unc = self.uncertainties[unc_name]
+        if getattr(unc, "members", None) is not None:
+            return self.getMemberShapes(
+                unc_name, process, era, channel, category, model_params, nominal_shape
+            )
+        return {
+            unc_scale: self.getShape(
+                process,
+                era,
+                channel,
+                category,
+                model_params,
+                unc_name,
+                unc_scale.name,
+            )
+            for unc_scale in [UncertaintyScale.Up, UncertaintyScale.Down]
+        }
+
     def addUncertainty(self, unc_name):
         unc = self.uncertainties[unc_name]
         isMVLnUnc = isinstance(unc, MultiValueLnNUncertainty)
@@ -1182,17 +1292,15 @@ class DatacardMaker:
                 nominal_shape = self.getShape(
                     self.processes[proc], era, channel, category, model_params
                 )
-
-                for unc_scale in [UncertaintyScale.Up, UncertaintyScale.Down]:
-                    shapes[unc_scale] = self.getShape(
-                        self.processes[proc],
-                        era,
-                        channel,
-                        category,
-                        model_params,
-                        unc_name,
-                        unc_scale.name,
-                    )
+                shapes = self.getVariedShapes(
+                    unc_name,
+                    self.processes[proc],
+                    era,
+                    channel,
+                    category,
+                    model_params,
+                    nominal_shape,
+                )
 
             unc_to_apply = unc.resolveType(
                 nominal_shape, shapes, self.autolnNThr, self.asymlnNThr
@@ -1290,16 +1398,15 @@ class DatacardMaker:
                         nominal_shape = self.getShape(
                             process, era, channel, category, params
                         )
-                        for us in [UncertaintyScale.Up, UncertaintyScale.Down]:
-                            shapes[us] = self.getShape(
-                                process,
-                                era,
-                                channel,
-                                category,
-                                params,
-                                unc_name,
-                                us.name,
-                            )
+                        shapes = self.getVariedShapes(
+                            unc_name,
+                            process,
+                            era,
+                            channel,
+                            category,
+                            params,
+                            nominal_shape,
+                        )
 
                     unc_to_apply = unc.resolveType(
                         nominal_shape, shapes, self.autolnNThr, self.asymlnNThr

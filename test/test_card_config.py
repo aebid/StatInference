@@ -34,6 +34,7 @@ import yaml  # noqa: E402
 
 from StatInference.common.card_config import (  # noqa: E402
     CardConfigError,
+    card_name_of,
     dump_card_config,
     load_card_config,
     load_card_config_with_sources,
@@ -222,11 +223,64 @@ class Merging(FilesTestCase):
         card = self.file("spin0.yaml", "include: [ spin0.yaml ]\n")
         self.assert_raises_naming(lambda: load_card_config(card), "the card itself")
 
-    def test_a_missing_include_raises(self):
+    def test_a_missing_include_raises_naming_the_card(self):
         card = self.file("spin0.yaml", SPIN0)
         self.assert_raises_naming(
-            lambda: load_card_config(card), "common.yaml: no such file"
+            lambda: load_card_config(card),
+            f"{card}: `include:` lists common.yaml, but there is no such file",
         )
+
+    def test_an_empty_include_raises(self):
+        card = self.file("spin0.yaml", 'include: [ "" ]\n')
+        self.assert_raises_naming(lambda: load_card_config(card), "an empty file name")
+
+    def test_a_key_set_twice_in_one_file_raises(self):
+        """YAML itself keeps the last of two equal keys; the loader refuses, naming the
+        file and both lines -- at the top level and inside an entry."""
+        card = self.file(
+            "card.yaml",
+            """
+            uncertainties:
+              - name: lumi
+            channels: [ eE ]
+            uncertainties:
+              - name: pileup
+            """,
+        )
+        self.assert_raises_naming(
+            lambda: load_card_config(card),
+            f"{card}: key 'uncertainties' is set twice in one mapping, on lines 2 and 5",
+        )
+        nested = self.file(
+            "nested.yaml",
+            """
+            uncertainties:
+              - name: lumi
+                type: lnN
+                type: shape
+            """,
+        )
+        self.assert_raises_naming(
+            lambda: load_card_config(nested), "key 'type' is set twice"
+        )
+
+    def test_a_merge_key_may_be_overridden(self):
+        """`<<:` brings in an anchor's keys; a key written next to it overrides the merged
+        one, as YAML intends -- only explicitly written keys are checked."""
+        card = self.file(
+            "card.yaml",
+            """
+            limit_plots:
+              - name: a
+                plot_params: &style { y_log: true, x_max: 1500 }
+              - name: b
+                plot_params:
+                  <<: *style
+                  x_max: 1000
+            """,
+        )
+        plots = load_card_config(card)["limit_plots"]
+        self.assertEqual(plots[1]["plot_params"], {"y_log": True, "x_max": 1000})
 
     def test_the_dump_reads_back_as_the_merged_card(self):
         self.file("common.yaml", COMMON)
@@ -264,6 +318,24 @@ class Cards(FilesTestCase):
             "'a' and 'b' are the same file",
         )
 
+    def test_two_keys_reading_as_one_name_raise(self):
+        self.file("a.yaml", "analysis: a\n")
+        self.file("b.yaml", "analysis: b\n")
+        self.assert_raises_naming(
+            lambda: self.resolve({1: "a.yaml", "1": "b.yaml"}),
+            "two cards are named '1'",
+        )
+
+    def test_a_card_name_with_a_trailing_newline_raises(self):
+        self.file("a.yaml", "analysis: a\n")
+        self.assert_raises_naming(lambda: self.resolve({"a\n": "a.yaml"}), "card name")
+
+    def test_a_config_cards_file_name_must_be_a_card_name(self):
+        self.assert_raises_naming(
+            lambda: card_name_of("/x/my card.yaml"), "card name 'my card'"
+        )
+        self.assertEqual(card_name_of("/x/dl_spin0.yaml"), "dl_spin0")
+
     def test_a_card_name_must_be_a_directory_name(self):
         self.file("a.yaml", "analysis: a\n")
         self.assert_raises_naming(lambda: self.resolve({"a/b": "a.yaml"}), "'a/b'")
@@ -296,6 +368,13 @@ processes:
     param_values: [ {", ".join(str(m) for m in fx.MASSES)} ]
     is_signal: true
   - TT
+limit_plots:
+  - name: b_limits
+    datacards:
+      - {{ name: "B", glob: "*.txt" }}
+impact_plots:
+  - name: b_impacts
+    masses: [ {fx.MASSES[0]} ]
 """
 #: the StatInference block's cards, relative to the analysis
 CARDS = (
@@ -431,6 +510,43 @@ class CardsChain(unittest.TestCase):
             os.path.join(self.tmp, "data", VERSION, "Datacards", "B", fx.ERA_C),
         )
 
+    def test_one_card_builds_only_its_own_branches(self):
+        """--card X requires X's datacard branches only, and through them only X's
+        preprocessing (A) or merged histograms (B): another card is neither built nor
+        waited for."""
+        all_branches = self.task(fx.si.CreateDatacardsTask).get_branch_map()
+        for card in ("A", "B"):
+            with self.subTest(card=card):
+                limits = self.task(fx.si.ResonantLimitsTask, card=card)
+                workflow = limits.requires()
+                own = {i for i, d in all_branches.items() if d["card"] == card}
+                self.assertEqual(set(workflow.get_branch_map()), own)
+                reqs = workflow.workflow_requires()
+                if card == "A":
+                    preprocess = reqs["PreprocessShapes"]
+                    self.assertEqual(
+                        {d["card"] for d in preprocess.get_branch_map().values()}, {"A"}
+                    )
+                else:
+                    self.assertNotIn("PreprocessShapes", reqs)
+                    merged = luigi.task.flatten(reqs)
+                    self.assertEqual({r.hist_era for r in merged}, {fx.ERA_C})
+        # the plot tasks reach the datacards through the card's limits
+        plots = self.task(fx.si.PlotResonantLimitsTask, card="B")
+        (limits,) = plots.requires()
+        self.assertEqual(
+            set(limits.requires().get_branch_map()),
+            {i for i, d in all_branches.items() if d["card"] == "B"},
+        )
+
+    def test_a_card_task_checks_every_cards_eras_at_construction(self):
+        """B needs only Run3_2023, but the datacard workflow builds its map over every
+        card, so A's eras are required too -- refused when the task is constructed, not
+        during scheduling (where a keep_alive worker would wait for ever)."""
+        with self.assertRaises(ValueError) as raised:
+            self.task(fx.si.ResonantLimitsTask, card="B", eras=(fx.ERA_C,))
+        self.assertIn(f"A {fx.GROUP}: {fx.ERA_A}, {fx.ERA_B}", str(raised.exception))
+
     def test_plots_per_card(self):
         for cls, name in (
             (fx.si.PlotResonantLimitsTask, "LimitPlots"),
@@ -440,7 +556,64 @@ class CardsChain(unittest.TestCase):
                 self.assertEqual(
                     self.task(cls, card="A").output().abspath, self.store(name, "A")
                 )
-                self.assertEqual(list(self.task(cls).requires()), ["A", "B"])
+                # A declares no plots: the all-cards wrapper leaves it out
+                self.assertEqual(list(self.task(cls).requires()), ["B"])
+
+    def test_a_plot_wrapper_with_no_card_to_plot_raises(self):
+        for cls in (fx.si.PlotResonantLimitsTask, fx.si.PlotPullsAndImpactsTask):
+            with self.subTest(cls=cls.__name__), mock.patch.object(
+                cls, "card_has_work", return_value=False
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    self.task(cls).requires()
+                self.assertIn(
+                    "no card has anything to do (A, B)", str(raised.exception)
+                )
+
+    def test_impact_plots_carry_the_card_in_their_name(self):
+        task = self.task(fx.si.PlotPullsAndImpactsTask, card="B")
+        entry = task.get_config_data()["impact_plots"][0]
+        # dhi is a stand-in here, so its parameter list cannot be checked
+        with mock.patch.object(
+            type(task), "card_for", return_value="card.txt"
+        ), mock.patch.object(type(task), "validate_plot_params"):
+            spec = task.build_plot_spec(entry, "combined", fx.MASSES[0])
+        self.assertEqual(spec["plot_postfix"], "B")
+
+    def test_an_include_cards_script_gets_the_merged_card(self):
+        """CreateDatacardsTask.run() for B, whose card includes a shared file: the
+        script's --config is the merged card -- no `include:` left, equal to what the
+        loader reads -- written into the task's output."""
+        import importlib
+
+        module = importlib.import_module("StatInference.law.CreateDatacardsTask")
+        workflow = self.task(fx.si.CreateDatacardsTask, make_plots=False)
+        (branch,) = [
+            t
+            for t in workflow.get_branch_tasks().values()
+            if t.branch_data["card"] == "B"
+        ][:1]
+        for req in luigi.task.flatten(branch.requires()):
+            fx.write(req.output().abspath, "")
+        calls = []
+
+        def ps_call(cmd, **kwargs):
+            config = cmd[cmd.index("--config") + 1]
+            with open(config) as f:
+                calls.append((cmd, yaml.safe_load(f)))
+            fx.write(os.path.join(cmd[cmd.index("--output") + 1], "payload"), "")
+
+        with mock.patch.object(module, "ps_call", ps_call), mock.patch.object(
+            type(branch), "cmssw_env", new_callable=mock.PropertyMock
+        ):
+            branch.run()
+        ((cmd, given),) = calls
+        self.assertNotIn("include", given)
+        self.assertEqual(given, load_card_config(branch.datacard_config_path("B")))
+        self.assertEqual(
+            os.path.basename(cmd[cmd.index("--config") + 1]), "card_config.yaml"
+        )
+        self.assertIn("card_config.yaml", os.listdir(branch.output().abspath))
 
     def test_an_unknown_card_raises(self):
         with self.assertRaises(ValueError) as raised:
@@ -452,6 +625,61 @@ class CardsChain(unittest.TestCase):
         with self.assertRaises(ValueError) as raised:
             workflow.get_branch_map()
         self.assertIn(f"B {fx.ERA_C}: {fx.ERA_C}", str(raised.exception))
+
+
+class RequestedMasses(unittest.TestCase):
+    """global.yaml's `param_values` serves every card: each card is built for the
+    requested masses it declares; a mass no card declares, or a card left with none,
+    raises."""
+
+    def run_with(self, param_values, check):
+        class Block(CardsChain):
+            pass
+
+        Block.statinference = CARDS + f"\n  param_values: {param_values}"
+        Block.setUpClass()
+        try:
+            fx.clear_process_caches()
+            check(
+                lambda cls, **kw: cls(
+                    version=VERSION, era=fx.ERAS, hists_version=HISTS_VERSION, **kw
+                )
+            )
+        finally:
+            Block.tearDownClass()
+
+    def test_each_card_gets_the_requested_masses_it_declares(self):
+        def check(task):
+            masses = {
+                d["mass"]
+                for d in task(fx.si.CreateDatacardsTask).get_branch_map().values()
+            }
+            self.assertEqual(masses, {fx.MASSES[0]})
+
+        self.run_with(f"[ {fx.MASSES[0]} ]", check)
+
+    def test_a_mass_no_card_declares_raises(self):
+        def check(task):
+            with self.assertRaises(ValueError) as raised:
+                task(fx.si.CreateDatacardsTask).get_branch_map()
+            self.assertIn("lists [999], which no card declares", str(raised.exception))
+
+        self.run_with(f"[ {fx.MASSES[0]}, 999 ]", check)
+
+    def test_a_card_left_with_no_mass_raises(self):
+        def check(task):
+            limits = task(fx.si.ResonantLimitsTask, card="B")
+            with mock.patch.object(
+                fx.si.CreateDatacardsTask,
+                "get_masses",
+                lambda self, card=None: [999] if card == "A" else fx.MASSES,
+            ):
+                fx.clear_process_caches()
+                with self.assertRaises(ValueError) as raised:
+                    limits.requires()
+            self.assertIn("card 'B' has no mass point to build", str(raised.exception))
+
+        self.run_with("[ 999 ]", check)
 
 
 class AmbiguousStatInferenceBlock(unittest.TestCase):

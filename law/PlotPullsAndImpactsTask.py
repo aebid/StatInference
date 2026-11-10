@@ -25,7 +25,7 @@ class PlotPullsAndImpactsTask(DhiPlotMixin, CardTask):
     inference/data/store, which is what makes a redraw cheap.
 
     The input is the combined card ResonantLimitsTask already writes -- one per mass,
-    every era in it, at ``<data>/<version>/Datacards/combined/combined_<mass>.txt``. Their
+    every era in it, at ``<data>/<version>/Datacards/<card>/combined/combined_<mass>.txt``. Their
     shape paths are absolute, which is what makes them usable here at all: PullsAndImpacts
     runs combine in a temporary directory.
 
@@ -52,6 +52,9 @@ class PlotPullsAndImpactsTask(DhiPlotMixin, CardTask):
         if self.all_cards:
             return {card: task.output() for card, task in self.card_tasks().items()}
         return self.output_dir_target(self.version, "ImpactPlots", self.this_card)
+
+    def card_has_work(self, card):
+        return bool(self.get_config_data(card).get("impact_plots"))
 
     def entry_eras(self, entry):
         """The eras an entry is drawn for.
@@ -211,6 +214,10 @@ class PlotPullsAndImpactsTask(DhiPlotMixin, CardTask):
         """
         name = entry.get("name") or "impacts"
         plot_params = dict(entry.get("plot_params") or {})
+        # The card in the file name: two cards sharing an entry (through an include, where
+        # a per-card plot_postfix is impossible) would otherwise write identically named
+        # PDFs, told apart by the directory alone.
+        plot_params.setdefault("plot_postfix", self.this_card)
         self.validate_plot_params(
             PlotPullsAndImpacts, plot_params, f"impact_plots entry '{name}'"
         )

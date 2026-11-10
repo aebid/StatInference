@@ -640,6 +640,33 @@ class StageMassDirTest(unittest.TestCase):
         with open(os.path.join(self.dest, "shapes.root")) as f:
             self.assertEqual(f.read(), "300\n")
 
+    def write_card(self, mass, header, content):
+        src = os.path.join(self.tmp, f"src_{mass}")
+        os.makedirs(src, exist_ok=True)
+        with open(os.path.join(src, "card_config.yaml"), "w") as f:
+            f.write(header + content)
+        with open(os.path.join(src, f"datacard_{mass}.txt"), "w") as f:
+            f.write(f"{mass}\n")
+        return src
+
+    def test_the_merged_card_is_kept_once_when_its_content_is_the_same(self):
+        """Every mass keeps the merged card it was built from; staged together, one copy
+        is kept -- also when the header comments differ, as between analysis areas."""
+        for mass, header in ((300, "# from /area/a\n"), (1000, "# from /other/b\n")):
+            src = self.write_card(mass, header, "eras: [ Run3_22_23 ]\n")
+            self.merge(src, self.dest, f"MX_{mass}")
+        self.assertEqual(
+            self.tree(), {"card_config.yaml", "datacard_300.txt", "datacard_1000.txt"}
+        )
+
+    def test_merged_cards_with_different_content_raise(self):
+        self.merge(self.write_card(300, "", "eras: [ A ]\n"), self.dest, "MX_300")
+        with self.assertRaises(RuntimeError) as raised:
+            self.merge(self.write_card(1000, "", "eras: [ B ]\n"), self.dest, "MX_1000")
+        self.assertIn(
+            "built from different versions of its configuration", str(raised.exception)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,7 +16,8 @@ class ResonantLimitsAndHistPlotTask(StatInferenceTask):
     declares in `limit_plots` are asked for separately, by running PlotResonantLimitsTask.
 
     Its output is a marker written once everything below it ran, so a version it finished
-    is not looked at again: a later run of that version over more eras plots nothing new.
+    is not looked at again: a later run of that version over more eras, or with more cards,
+    builds and plots nothing new.
     Run HistPlotTask or ResonantLimitsTask directly for that, or remove the marker first
     (`--remove-output 0,a,y`).
     """

@@ -111,14 +111,28 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
         return list(self.input_hist_reqs([self.branch_data]).values())
 
     def card_masses(self, card=None):
-        """The mass points a card is built for: global.yaml's StatInference
-        `param_values` if it restricts them, else every value the card declares.
-        """
-        return list(self.statinference_settings().get("param_values") or []) or (
-            self.get_masses(card)
-        )
+        """The mass points a card is built for: those of global.yaml's StatInference
+        `param_values` that the card declares, if it restricts them, else every value the
+        card declares. One global list serves every card, so a mass one card lacks is
+        simply not built for it (check_requested_masses() refuses one no card has)."""
+        own = self.get_masses(card)
+        requested = list(self.statinference_settings().get("param_values") or [])
+        return [m for m in requested if m in own] if requested else own
+
+    def check_requested_masses(self):
+        """Refuse a `param_values` mass no card declares: most likely a typo, and it
+        would otherwise just build nothing."""
+        requested = self.statinference_settings().get("param_values") or []
+        known = {m for card in self.card_names() for m in self.get_masses(card)}
+        unknown = [m for m in requested if m not in known]
+        if unknown:
+            raise ValueError(
+                f"{self.get_task_family()}: StatInference `param_values` lists "
+                f"{unknown}, which no card declares (in its processes' param_values)"
+            )
 
     def create_branch_map(self):
+        self.check_requested_masses()
         return dict(
             enumerate(
                 {"card": card, "era": era, "mass": mass}

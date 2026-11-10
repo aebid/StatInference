@@ -15,6 +15,7 @@ if __name__ == "__main__":
         sys.path.append(base_dir)
     __package__ = pkg_dir_name
 
+from StatInference.common.card_config import load_card_config
 from StatInference.common.tools import importROOT, CategoryNaming
 from StatInference.common.param_parse import extractParameters, applyParameters
 from StatInference.dc_make.model import Model
@@ -141,8 +142,9 @@ def lookup_frozen(frozen_binning, era, mass, channel, category):
 
 
 def load_config(config_path):
-    with open(config_path, "r") as f:
-        cfg = yaml.safe_load(f)
+    # Through the card loader: run by hand on a card with `include:`, the card is read
+    # merged, as the law chain's merged card_config.yaml already is.
+    cfg = load_card_config(config_path)
     model = Model.fromConfig(cfg["model"])
     channels = cfg["channels"]
     # Taken verbatim here; run() reduces them to the base categories the 2D input is

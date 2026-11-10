@@ -50,7 +50,7 @@ script driven by `bin_opt/bin_optimization.yaml`, and it exposes no importable A
 Which one an analysis is on is visible in its configuration: the `bin_opt` path sets
 `hist_bins` (as `config/x_hh_bbtautau_run2.yaml` does), while an analysis reading rebinned
 shapes leaves `hist_bins` unset and instead lists the sliced `categories:` and the
-`category_pattern` that names them (as HH→bbWW's `config/Datacards/x_hh_bbww_DL_run3.yaml`
+`category_pattern` that names them (as HH→bbWW's CI card `config/Datacards/CI/CI_card_DL.yaml`
 does). An analysis using neither simply lists the categories its input already has.
 
 `categories:` is always taken verbatim — it is the set of directories that exist in the
@@ -112,14 +112,29 @@ StatInference:
 ```
 
 The name is used for the law branches (`{card, era[, mass]}`), the output paths
-(`Datacards/<card>/<era>/...`, `ResonantLimitsTask/<card>/...`) and `--card` of the limit and
-plot tasks (without it they run every card); it does not appear in the datacards.
+(`Datacards/<card>/<era>/...`, `ResonantLimitsTask/<card>/...`, `LimitPlots/<card>`,
+`ImpactPlots/<card>`); it does not appear in the datacards.
+
+- **`--card <name>`** on `ResonantLimitsTask`, `PlotResonantLimitsTask` and
+  `PlotPullsAndImpactsTask` builds, preprocesses and fits that card only. Without it they run
+  every card; the plot tasks leave out (and name) a card that declares no plots.
+- `--era` must still hold the eras of **every** card, also with `--card`: the datacard
+  workflows' branch maps are built over all cards. A task refuses a missing era when it is
+  constructed.
+- The `StatInference` block's `param_values` (restricting the masses) and `hist_bins` apply
+  to every card. `param_values` builds each card for the requested masses it declares, and a
+  mass no card declares is refused; a global `hist_bins` overrides every card's own.
+- **The output paths changed** with the cards (a `<card>` level): run under a new
+  `--version`, not one produced before. Reusing one leaves `ResonantLimitsAndHistPlotTask`'s
+  marker complete (it ignores eras and cards), and old `LimitPlots/`/`ImpactPlots/` entries or
+  HTCondor job files can be mistaken for the new ones.
 
 A card can `include:` shared files, paths relative to the including file. The merge is strict
 and never overrides: `processes`, `uncertainties`, `limit_plots` and `impact_plots` are joined
 and an entry name defined twice raises; every other top-level key is set in one file only.
-Includes do not nest. A card without `include:` reads as before. To see a card merged, with the
-file each setting comes from:
+Includes do not nest. A key written twice in one file raises too (YAML itself would keep the
+last); keys brought in by a `<<:` merge may be overridden. A card without `include:` reads as
+before, except for those checks. To see a card merged, with the file each setting comes from:
 
 ```bash
 python3 StatInference/common/card_config.py <card.yaml>

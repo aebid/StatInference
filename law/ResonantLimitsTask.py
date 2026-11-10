@@ -1,4 +1,3 @@
-import filecmp
 import glob
 import law
 import luigi
@@ -7,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import yaml
 
 from dhi.tasks.resonant import MergeResonantLimits
 
@@ -16,6 +16,12 @@ from .CreateDatacardsTask import CreateDatacardsTask
 # Key for the cross-era merge in run()'s dynamic-dependency dict. Not an era name,
 # and deliberately not one a configuration could declare.
 COMBINED_KEY = "__combined__"
+
+
+def _same_config(path_a, path_b):
+    """Whether two YAML files hold the same configuration, whatever their comments."""
+    with open(path_a) as a, open(path_b) as b:
+        return yaml.safe_load(a) == yaml.safe_load(b)
 
 
 class ResonantLimitsTask(CardTask):
@@ -36,9 +42,27 @@ class ResonantLimitsTask(CardTask):
     def requires(self):
         if self.all_cards:
             return self.card_tasks()
-        # Every card's datacards, as one workflow: the jobs of a version are one set
-        # whichever card's limits ask for them.
-        return CreateDatacardsTask.req(self, branches=())
+        return CreateDatacardsTask.req(self, branches=self.card_branches())
+
+    def card_branches(self):
+        """The CreateDatacardsTask branches of this card, as a `branches` selection: only
+        they are built (and, through them, only this card's preprocessing), so one card's
+        limits neither wait for nor fail with another card. () -- the whole workflow --
+        when this card is every branch, as for a single card."""
+        workflow = CreateDatacardsTask.req(self, branches=())
+        branch_map = workflow.get_branch_map()
+        indices = tuple(
+            index
+            for index, data in branch_map.items()
+            if data["card"] == self.this_card
+        )
+        if not indices:
+            # () would select every branch
+            raise ValueError(
+                f"{self.get_task_family()}: card '{self.this_card}' has no mass point to "
+                "build: none of its masses is among StatInference `param_values`"
+            )
+        return () if len(indices) == len(branch_map) else indices
 
     def era_card_outputs(self):
         """{era: [the outputs of the branches that write this card's masses of that
@@ -118,8 +142,10 @@ class ResonantLimitsTask(CardTask):
         everything else to the same relative path, raising if that path already exists.
 
         The one exception is the merged card every mass keeps (MERGED_CARD_FILE): all
-        masses of a card are built from the same one, so it is kept once -- and it still
-        raises if two masses' copies differ.
+        masses of a card are built from the same one, so it is kept once. The copies are
+        compared as configuration, not as bytes -- the header comment names the source
+        files, so it differs between analysis areas -- and it raises if their content
+        differs.
         """
         for root, _, files in os.walk(src):
             rel = os.path.relpath(root, src)
@@ -131,12 +157,15 @@ class ResonantLimitsTask(CardTask):
             for name in files:
                 target = os.path.join(target_dir, name)
                 if os.path.lexists(target):
-                    if (
-                        not parts
-                        and name == CardTask.MERGED_CARD_FILE
-                        and filecmp.cmp(os.path.join(root, name), target, shallow=False)
-                    ):
-                        continue
+                    if not parts and name == CardTask.MERGED_CARD_FILE:
+                        if _same_config(os.path.join(root, name), target):
+                            continue
+                        raise RuntimeError(
+                            f"staging {mass_dir} into {dest}: its {name} differs from the "
+                            "one of the mass points staged before it -- the mass points of "
+                            "this card were built from different versions of its "
+                            "configuration; rebuild them under one version"
+                        )
                     raise RuntimeError(
                         f"staging {mass_dir} into {dest}: {os.path.join(*parts, name)} "
                         "was already written by another mass point"

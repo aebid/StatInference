@@ -61,6 +61,9 @@ class PlotResonantLimitsTask(DhiPlotMixin, CardTask):
             return {card: task.output() for card, task in self.card_tasks().items()}
         return self.output_dir_target(self.version, "LimitPlots", self.this_card)
 
+    def card_has_work(self, card):
+        return bool(self.get_config_data(card).get("limit_plots"))
+
     def _resolve_config_path(self, path):
         return path if os.path.isabs(path) else os.path.join(self.ana_path(), path)
 

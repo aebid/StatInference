@@ -44,7 +44,8 @@ class DatacardMaker:
 
         self.input_path = input_path
         # With its `include:` files merged in, by the rules of common/card_config.py; a
-        # card without includes reads exactly as yaml.safe_load() reads it.
+        # card without includes reads as yaml.safe_load() reads it, plus the checks of
+        # card_config.py (no key twice, unique entry names).
         cfg = load_card_config(cfg_file)
         for param in self.customizeble_parameters:
             if param not in kwargs:

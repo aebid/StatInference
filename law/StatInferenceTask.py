@@ -254,10 +254,11 @@ class StatInferenceTask(Task):
         return result
 
     def card_eras(self):
-        """The cards' eras this task is about (see cards()): those of its own `--card`
-        when it has one, else of every card."""
-        card = getattr(self, "card", None)
-        return self.cards([card] if card else None)
+        """[(card, era)] of every card, checked as cards() does -- also for a task with
+        `--card`: the datacard workflow it requires builds its branch map over every card,
+        so another card's missing era would otherwise fail only during scheduling, where
+        it leaves a keep_alive worker waiting (see check_card_eras)."""
+        return self.cards()
 
     def get_top_level_eras(self, card=None):
         """The eras that may be *combined* with each other: group eras plus any standalone
@@ -426,12 +427,33 @@ class CardTask(StatInferenceTask):
         """The card this task does: its `--card`, or the only card there is."""
         return self.resolve_card()
 
+    def card_has_work(self, card):
+        """Whether this task has anything to do for `card`; see card_tasks()."""
+        return True
+
     def card_tasks(self):
         """{card: this task for that card}, with every setting of this one: the same task,
-        for one card (FLAF's same-family req() guard asks which, cms-flaf/FLAF#356)."""
+        for one card (FLAF's same-family req() guard asks which, cms-flaf/FLAF#356).
+
+        Cards for which card_has_work() is false -- a plot task's card that declares no
+        plots -- are left out and named, rather than failing the whole run; if that leaves
+        no card at all, it raises."""
+        cards = [card for card in self.card_names() if self.card_has_work(card)]
+        skipped = [card for card in self.card_names() if card not in cards]
+        if not cards:
+            raise RuntimeError(
+                f"{self.get_task_family()}: no card has anything to do "
+                f"({', '.join(skipped)})"
+            )
+        if skipped and not getattr(self, "_reported_skips", False):
+            print(
+                f"{self.get_task_family()}: nothing to do for card(s) "
+                f"{', '.join(skipped)}; left out"
+            )
+            self._reported_skips = True
         return {
             card: self.__class__.req(self, card=card, _skip_task_excludes=True)
-            for card in self.card_names()
+            for card in cards
         }
 
     def store_parts(self):

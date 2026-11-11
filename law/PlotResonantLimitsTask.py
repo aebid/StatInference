@@ -16,11 +16,11 @@ from dhi.tasks.resonant import (
 )
 
 from .DhiPlotMixin import DhiPlotMixin
-from .StatInferenceTask import StatInferenceTask
+from .StatInferenceTask import CardTask
 from .ResonantLimitsTask import ResonantLimitsTask
 
 
-class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
+class PlotResonantLimitsTask(DhiPlotMixin, CardTask):
     """The limit plots, declared in the datacard configuration.
 
     Each entry of the config's ``limit_plots`` block becomes one dhi
@@ -48,6 +48,8 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
     check_card_eras = True
 
     def requires(self):
+        if self.all_cards:
+            return self.card_tasks()
         # ResonantLimitsTask is what mirrors the cards to datacards_dir(), which is what
         # the globs below resolve against -- the plots cannot be built before it has run.
         return [ResonantLimitsTask.req(self)]
@@ -55,7 +57,12 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
     def output(self):
         # fs_default, like CreateDatacardsTask. Holds one
         # <era>/ sub-directory of plots plus plots.json naming them.
-        return self.output_dir_target(self.version, "LimitPlots")
+        if self.all_cards:
+            return {card: task.output() for card, task in self.card_tasks().items()}
+        return self.output_dir_target(self.version, "LimitPlots", self.this_card)
+
+    def card_has_work(self, card):
+        return bool(self.get_config_data(card).get("limit_plots"))
 
     def _resolve_config_path(self, path):
         return path if os.path.isabs(path) else os.path.join(self.ana_path(), path)
@@ -325,6 +332,9 @@ class PlotResonantLimitsTask(DhiPlotMixin, StatInferenceTask):
         return out_path
 
     def run(self):
+        if self.all_cards:
+            # every card's plots are its requirements; nothing is left to do here
+            return
         entries = self.get_config_data().get("limit_plots", [])
         if not entries:
             raise RuntimeError(

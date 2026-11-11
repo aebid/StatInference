@@ -73,15 +73,23 @@ histogram?*
   `ResonantLimitsAndHistPlotTask`) check the eras against the cards when they are constructed
   (`check_card_eras`), so the error stops `law run` before scheduling; the card workflows check
   when they build their map, never in `__init__` (FLAF constructs them over single eras).
-- `CreateDatacardsTask` and `PreprocessShapesTask` are one workflow each whose branches are the
-  cards (`eras:` of the configuration, in its order); `branch_data` is the card era, which may
-  be a group era (`era_groups:`), never in `era` because FLAF's `Setup` knows only real eras.
-  `get_sub_eras(card_era)` lists the real eras whose histograms feed a card; `MergedHists`
-  reads each with `hist_era` from that era's own `fs_HistTuple`.
-- Outputs are keyed on the version and the card, the job state and the logs on the version and
-  the class (`store_parts()`, `remote_log_dir_target()`), never on `--era`, so a run over more
-  eras resumes the same jobs. One datacard configuration per version: the job file is named
-  after the branch numbers, i.e. the positions in `eras:`.
+- The analysis names its datacard *cards* in `global.yaml`'s `StatInference` block: `cards:`
+  (name → file) or `config:` (one card, named after its file); `common/card_config.py` reads
+  them, merging a card's `include:` files with no override (anything set twice raises, also a
+  key repeated in one file). A change there must keep "every ambiguity raises".
+- `CreateDatacardsTask` and `PreprocessShapesTask` are one workflow each whose branches are
+  `{card, era[, mass]}`, card by card in the order of `cards:`, each card's eras in the order of
+  its `eras:`; `era` may be a group era (`era_groups:`), never in the task's `era` because FLAF's
+  `Setup` knows only real eras. `get_sub_eras(card_era, card)` lists the real eras whose
+  histograms feed a card's era; `MergedHists` reads each with `hist_era` from that era's own
+  `fs_HistTuple`.
+- `ResonantLimitsTask` and the plot tasks are `CardTask`s: with `--card X` they require only
+  X's datacard branches (so only X is built and preprocessed); without it they stand for every
+  card. The construction-time era check covers every card, since the workflows' maps do.
+- Outputs are keyed on the version, the card and its era, the job state and the logs on the
+  version and the class (`store_parts()`, `remote_log_dir_target()`), never on `--era`, so a
+  run over more eras resumes the same jobs. The scripts of the chain get the card as one merged
+  file, `card_config.yaml`, kept next to their output.
 
 ### Binning optimisation
 
@@ -124,7 +132,7 @@ Verified 2026-08-27 (Tests row 2026-10-29); re-check before relying on any of it
 |---|---|
 | Layout | `dc_make/` (datacard construction: `maker.py`, `create_datacards.py`, `process.py`, `model.py`, `uncertainty.py`, `binner.py`), `bin_opt/` (binning optimisation and limits), `common/` (`tools.py`, `param_parse.py`), `law/tasks.py`, `fit_val/`, `config/`, `legacy/`, `test/` (unit tests and their scratch analysis) |
 | Consumers | HH_bbtautau and HH_bbWW use this as a submodule; H_mumu does not |
-| Cards | analysis-side, e.g. `HH_bbWW/config/Datacards/CI_card.yaml` |
-| Tests | `test/test_law_chain.py` (the law tasks on the real FLAF and law classes over a scratch analysis, `test/statinference_fixture.py`: per card the outputs, inputs and payload commands), `test/test_card_eras.py` (the card workflows over several eras) and `test/test_shape_plots.py` (which histograms a card's shape plots show, through `input_categories`); no ROOT, Combine or dhi; run by `unit-tests` against a pinned FLAF commit. `test/test_hist_ownership.py` (no histogram copy or fit function of `dc_make` left owned by nobody) needs ROOT, is marked `needs_root` and is not run by `unit-tests` |
+| Cards | analysis-side, listed in the analysis's `global.yaml` (`StatInference.cards`), e.g. `HH_bbWW/config/Datacards/DL/dl_spin0.yaml` (includes `../systematics.yaml` and `dl_common.yaml`) or the CI's `CI/CI_card_DL.yaml` |
+| Tests | `test/test_law_chain.py` (the law tasks on the real FLAF and law classes over a scratch analysis, `test/statinference_fixture.py`: per card the outputs, inputs and payload commands), `test/test_card_eras.py` (the card workflows over several eras) `test/test_shape_plots.py` (which histograms a card's shape plots show, through `input_categories`), `test/test_card_config.py` (the card loader's merge rules and errors, `cards:`/`config:`, a chain over several cards, `--card`) and `test/test_external_limits.py`; no ROOT, Combine or dhi; run by `unit-tests` against a pinned FLAF commit. `test/test_hist_ownership.py` (no histogram copy or fit function of `dc_make` left owned by nobody) needs ROOT, is marked `needs_root` and is not run by `unit-tests` |
 | Workflows | `formatting-check`, `unit-tests`, `repo-sanity-checks` (FLAF's sanity checks and FLAF's `run_tools/check_era_rename.py` for leftovers of the `period` → `era` rename), `trigger-flaf-integration`. Formatting is checked automatically — do not comment on it. A change to an assertion of `test/test_law_chain.py` (not to its helpers) changes what the chain is guaranteed to read, write or run — comment on it |
 | Integration test | Triggered by `@cms-flaf-bot please test`; the pipeline configuration lives in `cms-flaf/FLAF_ci` |

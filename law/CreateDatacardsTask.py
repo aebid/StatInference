@@ -19,8 +19,9 @@ from .StatInferenceTask import StatInferenceTask
 
 
 class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow):
-    """The datacards of the configuration, one branch per card (`eras:`, in its order) and
-    mass point: branch data {"era": card era, "mass": value}.
+    """The datacards of the configuration, one branch per card, era and mass point:
+    branch data {"card": card, "era": era, "mass": value}, card by card in the order of
+    `cards:`, each card's eras in the order of its `eras:`.
 
     Runs dc_make/create_datacards.py for one mass on whatever `<era>/<variable>/<variable>.root`
     tree it is given -- the configuration's `preprocess:` step if it declares one, otherwise
@@ -41,41 +42,59 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
     # merged shape (and hence each datacard bin) is built from.
     make_plots = luigi.BoolParameter(default=True)
 
-    def input_hist_reqs(self, card_eras, masses, branch=True):
-        """{key: task} for the shapes the cards of `card_eras` at `masses` are built from.
+    def preprocess_branches(self):
+        """{(card, era): branch} of PreprocessShapesTask, built the same way as its map."""
+        return {
+            (card, era): index
+            for index, (card, era) in enumerate(
+                (card, era)
+                for card, era in self.cards()
+                if self.preprocess_config(card)
+            )
+        }
 
-        The configuration's `preprocess:` step if it declares one -- the branches of those
-        cards (PreprocessShapesTask has one per card), as a workflow, or a single branch
-        task when `branch` and there is one card -- otherwise the merged histograms of
+    def input_hist_reqs(self, branches, branch=True):
+        """{key: task} for the shapes the branches `branches` (branch data) are built from.
+
+        For a card with a `preprocess:` step, the branches of PreprocessShapesTask of the
+        same cards and eras (one per card and era) -- as a workflow, or a single branch
+        task when `branch` and there is one -- for any other card the merged histograms of
         those masses' variables directly. Either way what arrives is
         "<era>/<variable>/<variable>.root", so nothing below here knows which it got.
         """
-        if self.preprocess_config():
-            cards = self.card_eras()
-            indices = sorted({cards.index(era) for era in card_eras})
+        reqs, indices = {}, set()
+        preprocess = None
+        for data in branches:
+            card, card_era = data["card"], data["era"]
+            if self.preprocess_config(card):
+                if preprocess is None:
+                    preprocess = self.preprocess_branches()
+                indices.add(preprocess[(card, card_era)])
+                continue
+            for (era, variable), req in self.mass_hist_reqs(
+                self.sub_eras_of([card_era], card), [data["mass"]], card
+            ).items():
+                reqs.setdefault(f"MergedHists_{era}_{variable}", req)
+        if indices:
+            indices = sorted(indices)
             if branch and len(indices) == 1:
                 req = PreprocessShapesTask.req(self, branch=indices[0])
             else:
                 req = PreprocessShapesTask.req(self, branch=-1, branches=tuple(indices))
-            return {"PreprocessShapes": req}
-        return {
-            f"MergedHists_{era}_{variable}": req
-            for (era, variable), req in self.mass_hist_reqs(
-                self.sub_eras_of(card_eras), masses
-            ).items()
-        }
+            reqs["PreprocessShapes"] = req
+        return reqs
 
-    def mass_hist_reqs(self, eras, masses):
-        """merged_hist_reqs(eras) of the variables that are the input of `masses` only: a
-        mass branch stages its own variable, not every mass point's."""
+    def mass_hist_reqs(self, eras, masses, card=None):
+        """merged_hist_reqs(eras) of the card's variables that are the input of `masses`
+        only: a mass branch stages its own variable, not every mass point's."""
         variables = {
             variable
-            for variable, points in self.get_variable_points().items()
+            for variable, points in self.get_variable_points(card).items()
             if any(value in masses for point in points for value in point.values())
         }
         return {
             key: req
-            for key, req in self.merged_hist_reqs(eras).items()
+            for key, req in self.merged_hist_reqs(eras, card).items()
             if key[1] in variables
         }
 
@@ -84,51 +103,62 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
         # puts the software bundles a submitted job unpacks in there, and returning only
         # our own inputs drops them, so the jobs start without the bundle they need.
         reqs = super().stage_workflow_requires()
-        # the cards of the selected branches only (the map honours --branches)
-        selected = self.get_branch_map().values()
-        card_eras = {data["era"] for data in selected}
-        masses = {data["mass"] for data in selected}
-        reqs.update(self.input_hist_reqs(card_eras, masses, branch=False))
+        # the selected branches only (the map honours --branches)
+        reqs.update(self.input_hist_reqs(self.get_branch_map().values(), branch=False))
         return reqs
 
     def requires(self):
-        data = self.branch_data
-        return list(self.input_hist_reqs([data["era"]], [data["mass"]]).values())
+        return list(self.input_hist_reqs([self.branch_data]).values())
 
-    def card_masses(self):
-        """The mass points the cards are built for: global.yaml's StatInference
-        `param_values` if it restricts them, else every value the configuration declares.
-        """
-        return list(self.statinference_settings().get("param_values") or []) or (
-            self.get_masses()
-        )
+    def card_masses(self, card=None):
+        """The mass points a card is built for: those of global.yaml's StatInference
+        `param_values` that the card declares, if it restricts them, else every value the
+        card declares. One global list serves every card, so a mass one card lacks is
+        simply not built for it (check_requested_masses() refuses one no card has)."""
+        own = self.get_masses(card)
+        requested = list(self.statinference_settings().get("param_values") or [])
+        return [m for m in requested if m in own] if requested else own
+
+    def check_requested_masses(self):
+        """Refuse a `param_values` mass no card declares: most likely a typo, and it
+        would otherwise just build nothing."""
+        requested = self.statinference_settings().get("param_values") or []
+        known = {m for card in self.card_names() for m in self.get_masses(card)}
+        unknown = [m for m in requested if m not in known]
+        if unknown:
+            raise ValueError(
+                f"{self.get_task_family()}: StatInference `param_values` lists "
+                f"{unknown}, which no card declares (in its processes' param_values)"
+            )
 
     def create_branch_map(self):
-        masses = self.card_masses()
+        self.check_requested_masses()
         return dict(
             enumerate(
-                {"era": era, "mass": mass}
-                for era in self.card_eras()
-                for mass in masses
+                {"card": card, "era": era, "mass": mass}
+                for card, era in self.card_eras()
+                for mass in self.card_masses(card)
             )
         )
 
     def output(self):
-        # fs_default, one directory per mass under the card's. Note that combine cannot read
-        # these directly: ResonantLimitsTask mirrors an era's masses back into one
+        # fs_default, one directory per mass under the card's era. Note that combine cannot
+        # read these directly: ResonantLimitsTask mirrors an era's masses back into one
         # datacards_dir() before handing them to dhi -- see ResonantLimitsTask.stage_datacards.
-        param = self.get_config_data()["model"]["parameters"][0]
+        card = self.branch_data["card"]
+        param = self.get_config_data(card)["model"]["parameters"][0]
         return self.output_dir_target(
             self.version,
             "Datacards",
+            card,
             self.branch_data["era"],
             f"{param}_{self.branch_data['mass']}",
         )
 
     def run(self):
+        card = self.branch_data["card"]
         card_era, mass = self.branch_data["era"], self.branch_data["mass"]
         statInf_entry = self.statinference_settings()
-        config = self.datacard_config_path()
         # ${ERA} in hist_bins names the era the cards are for, the same way the model's
         # input_file_pattern does. Each era has its own binning -- derived from its own
         # statistics, or its members' summed -- so one configuration serves them all.
@@ -145,22 +175,26 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
             self.ana_path(), "StatInference", "dc_make", "create_datacards.py"
         )
         with contextlib.ExitStack() as stack:
-            if self.preprocess_config():
+            if self.preprocess_config(card):
                 # PreprocessShapesTask already wrote the "<era>/<variable>/<variable>.root"
                 # layout, so its output directory is the base input_file_pattern resolves
                 # against -- nothing to stage.
-                reqs = self.input_hist_reqs([card_era], [mass])["PreprocessShapes"]
+                reqs = self.input_hist_reqs([self.branch_data])["PreprocessShapes"]
                 base_dir_local = stack.enter_context(reqs.output().localize("r"))
             else:
                 targets = {
                     key: req.output()
                     for key, req in self.mass_hist_reqs(
-                        self.get_sub_eras(card_era), [mass]
+                        self.get_sub_eras(card_era, card), [mass], card
                     ).items()
                 }
                 self.check_inputs(targets)
                 base_dir_local = stack.enter_context(self.stage_inputs(targets))
             local_output = stack.enter_context(self.output().localize("w"))
+            # The card as one merged file, kept with the datacards built from it.
+            config = self.write_merged_card(
+                card, os.path.join(local_output.abspath, self.MERGED_CARD_FILE)
+            )
             cmd = [
                 "python3",
                 create_datacards_py,
@@ -351,9 +385,10 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
         """
         import glob
 
-        cfg = self.get_config_data()
+        card = self.branch_data["card"]
+        cfg = self.get_config_data(card)
         card_era, mass = self.branch_data["era"], self.branch_data["mass"]
-        sub_eras = self.get_sub_eras(card_era)
+        sub_eras = self.get_sub_eras(card_era, card)
         plots_dir = os.path.join(output_dir, "plots")
         os.makedirs(plots_dir, exist_ok=True)
         plotter = os.path.join(self.ana_path(), "FLAF", "Analysis", "HistPlotter.py")
@@ -364,7 +399,7 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
         # this branch's mass point only: the variables whose input it is
         variable_points = {
             variable: [p for p in points if mass in p.values()]
-            for variable, points in self.get_variable_points().items()
+            for variable, points in self.get_variable_points(card).items()
         }
         variable_points = {v: p for v, p in variable_points.items() if p}
         for variable in sorted(variable_points):

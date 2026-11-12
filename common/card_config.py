@@ -1,0 +1,317 @@
+"""Reading datacard configurations: one card, the files it includes, and the list of cards.
+
+A *card* is one datacard configuration -- the file dc_make/create_datacards.py builds
+datacards from. It may list shared files under ``include:``; they are merged into it by
+the strict rules below, which never let one file override another. Anything set twice is
+an error naming both files, so a duplicated or conflicting setting cannot hide behind an
+include.
+
+global.yaml's StatInference block names the cards an analysis builds, each under the name
+the law tasks use for it in their branches and output paths (resolve_cards() checks it)::
+
+    StatInference:
+      cards:
+        DL_spin0: config/Datacards/DL/dl_spin0.yaml
+        DL_spin2: config/Datacards/DL/dl_spin2.yaml
+
+Merge rules (includes first, in their order, then the card itself):
+
+* A top-level list of named entries (NAMED_LISTS: ``processes`` by their ``process``,
+  a bare string entry by itself; ``uncertainties``, ``limit_plots`` and ``impact_plots``
+  by their ``name``) is joined across the files. An entry name seen twice raises --
+  also within one file, and also when both entries are identical.
+* Any other top-level key may be set in one file only; set in two, it raises, whatever
+  the values. Nothing is merged below the top level: a mapping such as ``model:`` is one
+  setting, defined whole in one file.
+* ``include:`` paths are relative to the directory of the file that includes them.
+  Included files cannot include further files, cannot be included twice, and cannot be
+  the card itself.
+
+A card without ``include:`` reads as yaml.safe_load() reads it, except for the checks that
+hold for every card: a key written twice in one mapping raises (YAML itself would keep the
+last), the named lists must be lists, and their entry names must be unique. Every existing
+card passes them. The merged result has the same layout as a plain card, so whatever reads a
+plain card (dc_make, a preprocess script) reads a merged one unchanged.
+"""
+
+import os
+import re
+
+import yaml
+
+#: top-level lists joined across files, and the key that names each entry
+NAMED_LISTS = {
+    "processes": "process",
+    "uncertainties": "name",
+    "limit_plots": "name",
+    "impact_plots": "name",
+}
+
+INCLUDE_KEY = "include"
+
+#: a card name becomes a directory in the output paths
+_CARD_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+
+_MERGE_TAG = "tag:yaml.org,2002:merge"
+
+
+class CardConfigError(ValueError):
+    """A datacard configuration that cannot be read without ambiguity."""
+
+
+class _StrictLoader(yaml.SafeLoader):
+    """yaml.SafeLoader, except that a key written twice in one mapping raises: PyYAML
+    keeps the last of them silently, which would drop e.g. a first `uncertainties:` block
+    without a word. Keys brought in by a `<<:` merge are not checked -- a key written
+    next to a merge overrides the merged one, which is what the merge is for."""
+
+    def construct_mapping(self, node, deep=False):
+        if isinstance(node, yaml.MappingNode):
+            seen = {}
+            for key_node, _ in node.value:
+                if key_node.tag == _MERGE_TAG:
+                    continue
+                key = self.construct_object(key_node, deep=True)
+                try:
+                    first = seen.get(key)
+                except TypeError:  # an unhashable key: PyYAML reports it itself
+                    continue
+                if first is not None:
+                    raise CardConfigError(
+                        f"{key_node.start_mark.name}: key '{key}' is set twice in one "
+                        f"mapping, on lines {first.line + 1} and "
+                        f"{key_node.start_mark.line + 1}; YAML would keep only the last"
+                    )
+                seen[key] = key_node.start_mark
+        return super().construct_mapping(node, deep=deep)
+
+
+def _read_yaml(path):
+    if not os.path.isfile(path):
+        raise CardConfigError(f"{path}: no such file")
+    with open(path, "r") as f:
+        data = yaml.load(f, Loader=_StrictLoader)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise CardConfigError(f"{path}: expected a mapping at the top level")
+    return data
+
+
+def _entry_name(key, entry, path, required):
+    """The name of one entry of the named list `key`, or None when it has none and
+    `required` is false."""
+    if key == "processes" and isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict) and entry.get(NAMED_LISTS[key]) is not None:
+        return str(entry[NAMED_LISTS[key]])
+    if required:
+        raise CardConfigError(
+            f"{path}: an entry of `{key}` has no `{NAMED_LISTS[key]}`; in a card that "
+            f"uses `{INCLUDE_KEY}:` every entry must be named, so that a duplicate can be "
+            f"recognised: {entry!r}"
+        )
+    return None
+
+
+def _include_paths(card_path, card):
+    includes = card.get(INCLUDE_KEY)
+    if includes is None:
+        return []
+    if isinstance(includes, str):
+        includes = [includes]
+    if not isinstance(includes, list) or not all(isinstance(i, str) for i in includes):
+        raise CardConfigError(
+            f"{card_path}: `{INCLUDE_KEY}:` must be a file name or a list of file names"
+        )
+    base = os.path.dirname(os.path.abspath(card_path))
+    paths, seen = [], {os.path.realpath(card_path): card_path}
+    for include in includes:
+        if not include.strip():
+            raise CardConfigError(
+                f"{card_path}: `{INCLUDE_KEY}:` lists an empty file name"
+            )
+        path = os.path.normpath(os.path.join(base, include))
+        if not os.path.isfile(path):
+            raise CardConfigError(
+                f"{card_path}: `{INCLUDE_KEY}:` lists {include}, but there is no such file "
+                f"{path} (include paths are relative to the including file)"
+            )
+        real = os.path.realpath(path)
+        if real in seen:
+            raise CardConfigError(
+                f"{card_path}: `{INCLUDE_KEY}:` lists {include}, which is "
+                + (
+                    "the card itself"
+                    if seen[real] == card_path
+                    else f"already included as {seen[real]}"
+                )
+            )
+        seen[real] = path
+        paths.append(path)
+    return paths
+
+
+def load_card_config_with_sources(path):
+    """(merged card, sources) for the card at `path`.
+
+    `sources` maps each top-level key to the file that sets it, and each named entry,
+    as (key, name), to the file that defines it.
+    """
+    path = os.path.abspath(path)
+    card = _read_yaml(path)
+    include_paths = _include_paths(path, card)
+    uses_includes = bool(include_paths)
+
+    files = []
+    for include in include_paths:
+        data = _read_yaml(include)
+        if INCLUDE_KEY in data:
+            raise CardConfigError(
+                f"{include} (included by {path}) sets `{INCLUDE_KEY}:`; included files "
+                "cannot include further files"
+            )
+        files.append((include, data))
+    files.append((path, {k: v for k, v in card.items() if k != INCLUDE_KEY}))
+
+    merged, sources = {}, {}
+    for file_path, data in files:
+        for key, value in data.items():
+            if key in NAMED_LISTS:
+                if not isinstance(value, list):
+                    raise CardConfigError(
+                        f"{file_path}: `{key}:` must be a list of named entries"
+                    )
+                merged.setdefault(key, [])
+                sources.setdefault(key, file_path)
+                for entry in value:
+                    name = _entry_name(key, entry, file_path, uses_includes)
+                    if name is not None:
+                        if (key, name) in sources:
+                            first = sources[(key, name)]
+                            where = (
+                                f"twice in {file_path}"
+                                if first == file_path
+                                else f"in {first} and in {file_path}"
+                            )
+                            raise CardConfigError(
+                                f"`{key}` entry '{name}' is defined {where}. Every entry "
+                                "is defined once: keep it in one file, or, if it differs "
+                                "between cards, in each card and not in a shared file."
+                            )
+                        sources[(key, name)] = file_path
+                    merged[key].append(entry)
+                continue
+            if key in sources:
+                raise CardConfigError(
+                    f"`{key}:` is set in {sources[key]} and in {file_path}. A setting is "
+                    "made in one file only, with no override: remove one of them."
+                )
+            sources[key] = file_path
+            merged[key] = value
+    return merged, sources
+
+
+def load_card_config(path):
+    """The card at `path` with its includes merged in; see the module docstring."""
+    return load_card_config_with_sources(path)[0]
+
+
+def dump_card_config(path, out_path, relative_to=None):
+    """Write the merged card at `path` to `out_path`, as a plain card (no includes) that
+    names the files it was merged from, relative to `relative_to` if given; returns the
+    merged card."""
+    merged, sources = load_card_config_with_sources(path)
+
+    def shown(file_path):
+        return os.path.relpath(file_path, relative_to) if relative_to else file_path
+
+    files = list(dict.fromkeys(sources.values()))
+    with open(out_path, "w") as f:
+        f.write(f"# The datacard configuration {shown(os.path.abspath(path))}\n")
+        if len(files) > 1:
+            f.write("# merged with the files it includes, in this order:\n")
+            for file_path in files:
+                f.write(f"#   {shown(file_path)}\n")
+        yaml.safe_dump(merged, f, sort_keys=False, default_flow_style=None, width=120)
+    return merged
+
+
+def resolve_cards(cards, base_dir, where):
+    """{card name: absolute path of its card file}, in the order of `cards`.
+
+    `cards` maps each card name to its file, relative to `base_dir` (global.yaml's
+    `cards:`, relative to the analysis). `where` names the mapping in error messages.
+    A name must be usable as a directory name, a file must exist, and two names cannot
+    point to the same file.
+    """
+    if not isinstance(cards, dict) or not cards:
+        raise CardConfigError(f"{where} must map each card name to its file")
+    result, seen = {}, {}
+    for key, card in cards.items():
+        name = str(key)
+        check_card_name(name, where)
+        if name in result:
+            raise CardConfigError(
+                f"{where}: two cards are named '{name}' (YAML keys {key!r} and another that "
+                "reads the same as text)"
+            )
+        if not isinstance(card, str):
+            raise CardConfigError(f"{where}: card '{name}' must name one file")
+        card_path = os.path.normpath(os.path.join(base_dir, card))
+        real = os.path.realpath(card_path)
+        if real in seen:
+            raise CardConfigError(
+                f"{where}: cards '{seen[real]}' and '{name}' are the same file {card}"
+            )
+        if not os.path.isfile(card_path):
+            raise CardConfigError(f"{where}: card '{name}': no such file {card_path}")
+        seen[real] = name
+        result[name] = card_path
+    return result
+
+
+def check_card_name(name, where):
+    """Raise unless `name` is usable as a card name: it becomes a directory name in the
+    output paths."""
+    if not isinstance(name, str) or not _CARD_NAME.fullmatch(name):
+        raise CardConfigError(
+            f"{where}: card name {name!r} is used as a directory name; use letters, digits, "
+            "'_', '-' and '.' only, starting with a letter or digit"
+        )
+
+
+def card_name_of(path):
+    """The name a lone card (StatInference `config:`) goes by: its file name without
+    the extension, checked as a `cards:` name is."""
+    name = os.path.splitext(os.path.basename(path))[0]
+    check_card_name(name, f"StatInference `config:` {path}")
+    return name
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Print a datacard configuration with its includes merged in."
+    )
+    parser.add_argument("card", help="the card file")
+    parser.add_argument("--output", help="write it here instead of printing it")
+    args = parser.parse_args()
+    try:
+        if args.output:
+            dump_card_config(args.card, args.output)
+        else:
+            merged, sources = load_card_config_with_sources(args.card)
+    except CardConfigError as error:
+        raise SystemExit(f"error: {error}")
+    if not args.output:
+        for key, value in merged.items():
+            if key in NAMED_LISTS:
+                print(f"{key}:")
+                for entry in value:
+                    name = _entry_name(key, entry, args.card, False)
+                    origin = sources.get((key, name), sources[key])
+                    print(f"  {name if name is not None else '(unnamed)'}  <- {origin}")
+            else:
+                print(f"{key}  <- {sources[key]}")

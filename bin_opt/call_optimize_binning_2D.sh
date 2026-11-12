@@ -1,6 +1,9 @@
 #!/bin/bash
 
 # Double Lep
+# NOTE: these recipes name HH_bbWW's x_hh_bbww_DL_run3.yaml, which HH_bbWW#197 split into
+# config/Datacards/DL/ (dl_common.yaml + dl_spin0.yaml, merged by StatInference/common/card_config.py);
+# pass a merged card (`python3 StatInference/common/card_config.py <card> --output <file>`).
 # python3 -i optimize_binning_2D.py --input-shapes /eos/user/d/daebi/HH_bbWW/merged_hists/v2601a/Run3_2023BPix/ --file-name-pattern DL_DNN_m{m}_vs_HME/DL_DNN_m{m}_vs_HME.root --sig-name-pattern XtoHHto2B2W_2L_{m} --output 13Feb_DL/2023BPix/ --config ../../config/Datacards/x_hh_bbww_DL_run3.yaml --mass-list 300,400,500,550,600,650,700,800,900,1000 --channels eE,eMu,muMu --categories ZVeto_OS_Iso/res2b,ZVeto_OS_Iso/boosted,ZVeto_OS_Iso/recovery --background-names TT,DY,ST,VV --important-backgrounds TT,DY
 # python3 -i optimize_binning_2D.py --input-shapes /eos/user/d/daebi/HH_bbWW/merged_hists/v2601a/Run3_2023/ --file-name-pattern DL_DNN_m{m}_vs_HME/DL_DNN_m{m}_vs_HME.root --sig-name-pattern XtoHHto2B2W_2L_{m} --output 13Feb_DL/2023/ --config ../../config/Datacards/x_hh_bbww_DL_run3.yaml --mass-list 300,400,500,550,600,650,700,800,900,1000 --channels eE,eMu,muMu --categories ZVeto_OS_Iso/res2b,ZVeto_OS_Iso/boosted,ZVeto_OS_Iso/recovery --background-names TT,DY,ST,VV --important-backgrounds TT,DY
 # python3 -i optimize_binning_2D.py --input-shapes /eos/user/d/daebi/HH_bbWW/merged_hists/v2601a/Run3_2022EE/ --file-name-pattern DL_DNN_m{m}_vs_HME/DL_DNN_m{m}_vs_HME.root --sig-name-pattern XtoHHto2B2W_2L_{m} --output 13Feb_DL_significance/2022EE/ --config ../../config/Datacards/x_hh_bbww_DL_run3.yaml --mass-list 300,400,500,550,600,650,700,800,900,1000 --channels eE,eMu,muMu --categories ZVeto_OS_Iso/res2b,ZVeto_OS_Iso/boosted,ZVeto_OS_Iso/recovery --background-names TT,DY,ST,VV --important-backgrounds TT,DY

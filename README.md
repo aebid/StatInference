@@ -24,10 +24,10 @@ merged histograms as they are:
 ```yaml
 preprocess:
   script: StatInference/bin_opt_2d/rebin_2d.py
-  args: [--binning-config, config/Datacards/binning_2d.yaml]
+  args: [--binning-config, config/Datacards/DL/binning_2d.yaml]
 ```
 
-The knobs live with the analysis (`config/Datacards/binning_2d.yaml`) because they are
+The knobs live with the analysis (`config/Datacards/DL/binning_2d.yaml`) because they are
 analysis configuration; the derived `binning.json` lives with the shapes it produced,
 because it is a product of the run rather than an input to it.
 
@@ -50,7 +50,7 @@ script driven by `bin_opt/bin_optimization.yaml`, and it exposes no importable A
 Which one an analysis is on is visible in its configuration: the `bin_opt` path sets
 `hist_bins` (as `config/x_hh_bbtautau_run2.yaml` does), while an analysis reading rebinned
 shapes leaves `hist_bins` unset and instead lists the sliced `categories:` and the
-`category_pattern` that names them (as HH→bbWW's `config/Datacards/x_hh_bbww_DL_run3.yaml`
+`category_pattern` that names them (as HH→bbWW's CI card `config/Datacards/CI/CI_card_DL.yaml`
 does). An analysis using neither simply lists the categories its input already has.
 
 `categories:` is always taken verbatim — it is the set of directories that exist in the
@@ -107,6 +107,52 @@ sub-eras of a meta-era are summed and in the final binning, since the reduction 
 linear. See `dc_make/member_reduction.py` for the syntax and the formulas;
 `test/test_member_reduction.py` checks them (no ROOT needed).
 
+## Datacard cards
+
+The chain builds the datacard *cards* the analysis's `global.yaml` names in its
+`StatInference` block: either `cards:`, each card's name and file (paths relative to the
+analysis), or `config:`, a single card, which then goes by its file name. Setting both is an
+error.
+
+```yaml
+StatInference:
+  cards:
+    DL_spin0: config/Datacards/DL/dl_spin0.yaml
+    DL_spin2: config/Datacards/DL/dl_spin2.yaml
+```
+
+The name is used for the law branches (`{card, era[, mass]}`), the output paths
+(`Datacards/<card>/<era>/...`, `ResonantLimitsTask/<card>/...`, `LimitPlots/<card>`,
+`ImpactPlots/<card>`); it does not appear in the datacards.
+
+- **`--card <name>`** on `ResonantLimitsTask`, `PlotResonantLimitsTask` and
+  `PlotPullsAndImpactsTask` builds, preprocesses and fits that card only. Without it they run
+  every card; the plot tasks leave out (and name) a card that declares no plots.
+- `--era` must still hold the eras of **every** card, also with `--card`: the datacard
+  workflows' branch maps are built over all cards. A task refuses a missing era when it is
+  constructed.
+- The `StatInference` block's `param_values` (restricting the masses) and `hist_bins` apply
+  to every card. `param_values` builds each card for the requested masses it declares, and a
+  mass no card declares is refused; a global `hist_bins` overrides every card's own.
+- **The output paths changed** with the cards (a `<card>` level): run under a new
+  `--version`, not one produced before. Reusing one leaves `ResonantLimitsAndHistPlotTask`'s
+  marker complete (it ignores eras and cards), and old `LimitPlots/`/`ImpactPlots/` entries or
+  HTCondor job files can be mistaken for the new ones.
+
+A card can `include:` shared files, paths relative to the including file. The merge is strict
+and never overrides: `processes`, `uncertainties`, `limit_plots` and `impact_plots` are joined
+and an entry name defined twice raises; every other top-level key is set in one file only.
+Includes do not nest. A key written twice in one file raises too (YAML itself would keep the
+last); keys brought in by a `<<:` merge may be overridden. A card without `include:` reads as
+before, except for those checks. To see a card merged, with the file each setting comes from:
+
+```bash
+python3 StatInference/common/card_config.py <card.yaml>
+```
+
+The chain hands its scripts (the preprocess step, `create_datacards.py`) the merged card as one
+file, `card_config.yaml`, kept next to their output. See `common/card_config.py` for the rules.
+
 ## Unit tests
 
 `test/test_law_chain.py` checks the law tasks on the real FLAF and law classes over a scratch
@@ -114,6 +160,8 @@ analysis (`test/statinference_fixture.py`): for each card, what it writes, which
 histograms it reads and the commands it runs. `test/test_card_eras.py` checks the card
 workflows over several eras, and `test/test_shape_plots.py` which histograms the shape plots
 of a card show, for categories read through `input_categories`.
+`test/test_card_config.py` checks the card loader's merge rules and a chain over several
+cards, one of them with an include (not yet in the `unit-tests` workflow's file list).
 They need no ROOT, Combine or dhi. The `unit-tests` workflow runs them against a pinned FLAF
 commit; to run them locally, put a FLAF checkout at that commit (`ref:` in
 `.github/workflows/unit-tests.yaml`) next to this one and run from the directory holding both:
@@ -121,5 +169,6 @@ commit; to run them locally, put a FLAF checkout at that commit (`ref:` in
 ```bash
 pip install pyyaml numpy luigi==3.8.1 law==0.1.21 pytest
 PYTHONPATH=$PWD python -m pytest -q StatInference/test/test_law_chain.py \
-    StatInference/test/test_card_eras.py StatInference/test/test_shape_plots.py
+    StatInference/test/test_card_eras.py StatInference/test/test_shape_plots.py \
+    StatInference/test/test_card_config.py
 ```

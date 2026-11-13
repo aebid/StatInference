@@ -43,21 +43,18 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
     make_plots = luigi.BoolParameter(default=True)
 
     def preprocess_branches(self):
-        """{(card, era): branch} of PreprocessShapesTask, built the same way as its map."""
+        """{(card, era, mass): branch} of PreprocessShapesTask, built the same way as its
+        map."""
         return {
-            (card, era): index
-            for index, (card, era) in enumerate(
-                (card, era)
-                for card, era in self.cards()
-                if self.preprocess_config(card)
-            )
+            (data["card"], data["era"], data["mass"]): index
+            for index, data in enumerate(PreprocessShapesTask.branch_data_of(self))
         }
 
     def input_hist_reqs(self, branches, branch=True):
         """{key: task} for the shapes the branches `branches` (branch data) are built from.
 
         For a card with a `preprocess:` step, the branches of PreprocessShapesTask of the
-        same cards and eras (one per card and era) -- as a workflow, or a single branch
+        same cards, eras and masses (one per card, era and mass) -- as a workflow, or a single branch
         task when `branch` and there is one -- for any other card the merged histograms of
         those masses' variables directly. Either way what arrives is
         "<era>/<variable>/<variable>.root", so nothing below here knows which it got.
@@ -69,7 +66,7 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
             if self.preprocess_config(card):
                 if preprocess is None:
                     preprocess = self.preprocess_branches()
-                indices.add(preprocess[(card, card_era)])
+                indices.add(preprocess[(card, card_era, data["mass"])])
                 continue
             for (era, variable), req in self.mass_hist_reqs(
                 self.sub_eras_of([card_era], card), [data["mass"]], card
@@ -84,20 +81,6 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
             reqs["PreprocessShapes"] = req
         return reqs
 
-    def mass_hist_reqs(self, eras, masses, card=None):
-        """merged_hist_reqs(eras) of the card's variables that are the input of `masses`
-        only: a mass branch stages its own variable, not every mass point's."""
-        variables = {
-            variable
-            for variable, points in self.get_variable_points(card).items()
-            if any(value in masses for point in points for value in point.values())
-        }
-        return {
-            key: req
-            for key, req in self.merged_hist_reqs(eras, card).items()
-            if key[1] in variables
-        }
-
     def stage_workflow_requires(self):
         # Merged with the base class's rather than replacing them: FLAF's HTCondorWorkflow
         # puts the software bundles a submitted job unpacks in there, and returning only
@@ -109,27 +92,6 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
 
     def requires(self):
         return list(self.input_hist_reqs([self.branch_data]).values())
-
-    def card_masses(self, card=None):
-        """The mass points a card is built for: those of global.yaml's StatInference
-        `param_values` that the card declares, if it restricts them, else every value the
-        card declares. One global list serves every card, so a mass one card lacks is
-        simply not built for it (check_requested_masses() refuses one no card has)."""
-        own = self.get_masses(card)
-        requested = list(self.statinference_settings().get("param_values") or [])
-        return [m for m in requested if m in own] if requested else own
-
-    def check_requested_masses(self):
-        """Refuse a `param_values` mass no card declares: most likely a typo, and it
-        would otherwise just build nothing."""
-        requested = self.statinference_settings().get("param_values") or []
-        known = {m for card in self.card_names() for m in self.get_masses(card)}
-        unknown = [m for m in requested if m not in known]
-        if unknown:
-            raise ValueError(
-                f"{self.get_task_family()}: StatInference `param_values` lists "
-                f"{unknown}, which no card declares (in its processes' param_values)"
-            )
 
     def create_branch_map(self):
         self.check_requested_masses()

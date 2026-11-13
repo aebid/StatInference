@@ -462,16 +462,18 @@ class CardsChain(unittest.TestCase):
         preprocess = self.task(fx.si.PreprocessShapesTask)
         self.assertEqual(
             list(preprocess.get_branch_map().values()),
-            [{"card": "A", "era": era} for era in fx.CARD_ERAS],
+            [
+                {"card": "A", "era": era, "mass": mass}
+                for era in fx.CARD_ERAS
+                for mass in preprocess.card_masses("A")
+            ],
         )
         for branch in self.task(fx.si.CreateDatacardsTask).get_branch_tasks().values():
             reqs = luigi.task.flatten(branch.requires())
             if branch.branch_data["card"] == "A":
                 (req,) = reqs
                 self.assertIsInstance(req, fx.si.PreprocessShapesTask)
-                self.assertEqual(
-                    req.branch_data, {"card": "A", "era": branch.branch_data["era"]}
-                )
+                self.assertEqual(req.branch_data, branch.branch_data)
             else:
                 self.assertTrue(all(isinstance(r, fx.si.MergedHists) for r in reqs))
                 self.assertEqual({r.hist_era for r in reqs}, {fx.ERA_C})

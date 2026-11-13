@@ -500,23 +500,31 @@ class PreprocessChainTest(ChainTestCase):
     card_file = "config/Datacards/card_preprocess.yaml"
 
     def test_card_reads_its_preprocessed_shapes(self):
-        for (card_era, _), card in cards_of(limits_task()).items():
+        branches = [(card_era, mass) for card_era in fx.CARD_ERAS for mass in fx.MASSES]
+        for (card_era, mass), card in cards_of(limits_task()).items():
             preprocess = preprocess_of(card)
-            # every mass of a card reads the one preprocessing branch of that card
-            self.assertEqual(preprocess.branch, fx.CARD_ERAS.index(card_era))
+            # each mass of a card reads the preprocessing branch of that card and mass
+            self.assertEqual(preprocess.branch, branches.index((card_era, mass)))
             self.assertEqual(
-                preprocess.branch_data, {"card": self.card_name, "era": card_era}
+                preprocess.branch_data,
+                {"card": self.card_name, "era": card_era, "mass": mass},
             )
             self.assertEqual(
                 preprocess.output().abspath,
                 self.store(
-                    "default", VERSION, "Hists_preprocessed", self.card_name, card_era
+                    "default",
+                    VERSION,
+                    "Hists_preprocessed",
+                    self.card_name,
+                    card_era,
+                    f"MX_{mass}",
                 ),
             )
+            # only that mass's input crosses the network
             reqs = luigi.task.flatten(preprocess.requires())
             self.assertTrue(all(isinstance(r, fx.si.MergedHists) for r in reqs))
             self.assertEqual(
-                {r.output().abspath for r in reqs}, self.merged_hists(card_era)
+                {r.output().abspath for r in reqs}, self.merged_hists(card_era, mass)
             )
 
     def test_workflows_require_every_cards_inputs(self):
@@ -540,11 +548,11 @@ class PreprocessChainTest(ChainTestCase):
         self.write_merged_hists()
         ana = self.ana
         preprocess_of_card = {
-            card_era: preprocess_of(card)
-            for (card_era, _), card in cards_of(limits_task()).items()
+            (card_era, mass): preprocess_of(card)
+            for (card_era, mass), card in cards_of(limits_task()).items()
         }
-        for card_era, preprocess in preprocess_of_card.items():
-            with self.subTest(card=card_era):
+        for (card_era, mass), preprocess in preprocess_of_card.items():
+            with self.subTest(card=card_era, mass=mass):
                 (call,) = self.run_payload(preprocess, preprocess_module)
                 cmd, env, files = call
                 self.assertEqual(
@@ -567,7 +575,7 @@ class PreprocessChainTest(ChainTestCase):
                 )
                 self.assertEqual(self.arg(cmd, "--tag"), card_era)
                 self.assertEqual(env, {"CMSSW_ENV": "1"})
-                self.assertEqual(files, self.staged_layout(card_era))
+                self.assertEqual(files, self.staged_layout(card_era, mass))
                 self.assertEqual(
                     set(os.listdir(preprocess.output().abspath)),
                     {"payload_output", "card_config.yaml"},

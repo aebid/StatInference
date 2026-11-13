@@ -331,6 +331,27 @@ class StatInferenceTask(Task):
         """
         return sorted(self.get_variable_points(card))
 
+    def card_masses(self, card=None):
+        """The mass points a card is built for: those of global.yaml's StatInference
+        `param_values` that the card declares, if it restricts them, else every value the
+        card declares. One global list serves every card, so a mass one card lacks is
+        simply not built for it (check_requested_masses() refuses one no card has)."""
+        own = self.get_masses(card)
+        requested = list(self.statinference_settings().get("param_values") or [])
+        return [m for m in requested if m in own] if requested else own
+
+    def check_requested_masses(self):
+        """Refuse a `param_values` mass no card declares: most likely a typo, and it
+        would otherwise just build nothing."""
+        requested = self.statinference_settings().get("param_values") or []
+        known = {m for card in self.card_names() for m in self.get_masses(card)}
+        unknown = [m for m in requested if m not in known]
+        if unknown:
+            raise ValueError(
+                f"{self.get_task_family()}: StatInference `param_values` lists "
+                f"{unknown}, which no card declares (in its processes' param_values)"
+            )
+
     def merged_hist_reqs(self, eras, card=None):
         """{(era, variable): MergedHists} -- every merged input file of the card for
         those eras.
@@ -345,6 +366,20 @@ class StatInferenceTask(Task):
             (era, variable): MergedHists.req(self, hist_era=era, variable=variable)
             for era in eras
             for variable in self.get_required_variables(card)
+        }
+
+    def mass_hist_reqs(self, eras, masses, card=None):
+        """merged_hist_reqs(eras) of the card's variables that are the input of `masses`
+        only: a mass branch stages its own variable, not every mass point's."""
+        variables = {
+            variable
+            for variable, points in self.get_variable_points(card).items()
+            if any(value in masses for point in points for value in point.values())
+        }
+        return {
+            key: req
+            for key, req in self.merged_hist_reqs(eras, card).items()
+            if key[1] in variables
         }
 
     def sub_eras_of(self, card_eras, card=None):

@@ -227,15 +227,11 @@ class CardsPairAndCarryEveryEra(CardTestCase):
         for card in cards.values():
             (preprocess,) = card.requires()
             self.assertIsInstance(preprocess, fx.si.PreprocessShapesTask)
-            self.assertEqual(
-                preprocess.branch, fx.CARD_ERAS.index(card.branch_data["era"])
-            )
-            self.assertEqual(
-                preprocess.branch_data,
-                {"card": "card_preprocess", "era": card.branch_data["era"]},
-            )
+            # one preprocessing branch per card, era and mass: the datacard branch's own
+            self.assertEqual(preprocess.branch, card.branch)
+            self.assertEqual(preprocess.branch_data, card.branch_data)
             outputs.add(preprocess.output().abspath)
-        self.assertEqual(len(outputs), len(fx.CARD_ERAS))
+        self.assertEqual(len(outputs), len(fx.CARD_ERAS) * len(fx.MASSES))
 
     def test_the_workflow_requires_the_preprocess_workflow(self):
         reqs = self.task(fx.si.CreateDatacardsTask).workflow_requires()
@@ -267,10 +263,8 @@ class SelectedCards(CardTestCase):
         cards = card_masses(card="card_preprocess")
         self.assertEqual(workflow.get_branch_map(), {b: cards[b] for b in branches})
         preprocess = workflow.workflow_requires()["PreprocessShapes"]
-        self.assertEqual(
-            preprocess.get_branch_map(),
-            {1: {"card": "card_preprocess", "era": fx.CARD_ERAS[1]}},
-        )
+        # the same branches: one preprocessing branch per card, era and mass
+        self.assertEqual(preprocess.get_branch_map(), {b: cards[b] for b in branches})
         reqs = luigi.task.flatten(preprocess.workflow_requires())
         self.assertEqual({r.hist_era for r in reqs}, set(fx.SUB_ERAS[fx.CARD_ERAS[1]]))
 

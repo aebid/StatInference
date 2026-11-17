@@ -5,6 +5,8 @@ import shutil
 
 from FLAF.RunKit.run_tools import ps_call
 
+from .dhi_workflow import dhi_workflow_args
+
 
 class DhiPlotMixin:
     """Running a dhi plot task from a StatInference task, and keeping what it drew.
@@ -63,11 +65,14 @@ class DhiPlotMixin:
     def plot_command(self, task_cls, spec, extra_args=()):
         """`law run <dhi plot task> ...` for a spec.
 
-        ``extra_args`` is appended verbatim. It exists for the arguments that belong to a
-        task upstream of the one being run rather than to it -- law namespaces those as
-        --<TaskName>-<param>, so they are not parameters of task_cls and cannot go in the
-        spec. Sending the per-parameter fits of PullsAndImpacts to HTCondor is the case
-        that needs it: --PullsAndImpacts-workflow htcondor.
+        The task's --workflow is passed on to the dhi fits upstream of the plot
+        (--ResonantLimits-workflow, --PullsAndImpacts-workflow; see dhi_workflow): the
+        subprocess does not see this process's command line or configuration.
+
+        ``extra_args`` is appended verbatim, after those, so it can override them. It
+        exists for the arguments that belong to a task upstream of the one being run rather
+        than to it -- law namespaces those as --<TaskName>-<param>, so they are not
+        parameters of task_cls and cannot go in the spec.
         """
         cmd = ["law", "run", task_cls.__name__]
         for key, value in spec.items():
@@ -94,6 +99,7 @@ class DhiPlotMixin:
                 cmd += [flag, ",".join(str(v) for v in value)]
             else:
                 cmd += [flag, str(value)]
+        cmd += dhi_workflow_args(getattr(self, "workflow", law.NO_STR))
         cmd += [str(a) for a in extra_args]
         if self.redraw:
             cmd += ["--remove-output", "0,a,y"]

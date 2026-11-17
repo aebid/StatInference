@@ -36,7 +36,8 @@ class PlotPullsAndImpactsTask(DhiPlotMixin, CardTask):
     """
 
     # Not a workflow itself. The parameter exists so that --workflow reaches the tasks
-    # below that are -- law's req() only forwards parameters both tasks declare -- and
+    # below that are -- law's req() only forwards parameters both tasks declare; the dhi
+    # fits get it through DhiPlotMixin.plot_command (dhi_workflow) -- and
     # NO_STR leaves each of those at its own default.
     workflow = luigi.Parameter(default=law.parameter.NO_STR)
 

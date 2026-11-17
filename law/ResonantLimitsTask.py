@@ -12,6 +12,7 @@ from dhi.tasks.resonant import MergeResonantLimits
 
 from .StatInferenceTask import CardTask
 from .CreateDatacardsTask import CreateDatacardsTask
+from .dhi_workflow import set_dhi_workflow
 
 # Key for the cross-era merge in run()'s dynamic-dependency dict. Not an era name,
 # and deliberately not one a configuration could declare.
@@ -30,8 +31,9 @@ class ResonantLimitsTask(CardTask):
     """
 
     # Not a workflow itself. The parameter exists so that --workflow reaches the tasks
-    # below that are -- law's req() only forwards parameters both tasks declare -- and
-    # NO_STR leaves each of those at its own default.
+    # below that are -- law's req() only forwards parameters both tasks declare; run()
+    # passes it to dhi's ResonantLimits fits (dhi_workflow) -- and NO_STR leaves each of
+    # those at its own default.
     workflow = luigi.Parameter(default=law.parameter.NO_STR)
 
     check_card_eras = True
@@ -230,6 +232,9 @@ class ResonantLimitsTask(CardTask):
         # *and* its members -- x_hh_bbww_DL_run3_1D.yaml does -- that counted every
         # 2022-2023BPix event twice, and the result was one over-strong limit per mass
         # rather than the per-era limits get_all_eras() describes.
+        # MergeResonantLimits builds the ResonantLimits fits itself, out of reach of req():
+        # --workflow gets to them through the configuration.
+        set_dhi_workflow(self.workflow)
         merges = {
             e: MergeResonantLimits(version=self.version, datacards=tuple(cards))
             for e, cards in era_cards.items()

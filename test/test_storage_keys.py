@@ -75,8 +75,10 @@ class StorageKeysTest(chain.ChainTestCase):
                 preprocess = chain.preprocess_of(card)
                 reqs = luigi.task.flatten(preprocess.requires())
                 self.assertTrue(all(isinstance(r, fx.si.MergedHists) for r in reqs))
+                # one preprocessing branch per card, era and mass: that mass's inputs only
                 self.assertEqual(
-                    {r.output().abspath for r in reqs}, self.merged_hists(card_era)
+                    {r.output().abspath for r in reqs},
+                    self.merged_hists(card_era, mass),
                 )
 
     def test_merged_hists_is_the_path_flaf_writes(self):
@@ -117,6 +119,7 @@ class StorageKeysTest(chain.ChainTestCase):
                         "Hists_preprocessed",
                         self.card_name,
                         card_era,
+                        f"MX_{mass}",
                     ),
                 )
         for cls, directory in (

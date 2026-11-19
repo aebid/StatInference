@@ -21,7 +21,7 @@ class PlotPullsAndImpactsTask(DhiPlotMixin, CardTask):
 
     Each entry of the config's ``impact_plots`` block becomes one dhi PlotPullsAndImpacts
     task per mass point it lists. Like the limit plots, the results are copied to
-    fs_default beside the rest of the chain's products; dhi keeps its own copy under
+    fs_StatInference beside the rest of the chain's products; dhi keeps its own copy under
     inference/data/store, which is what makes a redraw cheap.
 
     The input is the combined card ResonantLimitsTask already writes -- one per mass,

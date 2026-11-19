@@ -63,8 +63,9 @@ class StatInferenceTask(Task):
     def input_hists_version(self):
         return self.hists_version or self.version
 
-    def output_dir_target(self, *path):
-        """remote_dir_target() that also works when fs_default is a local directory.
+    def output_dir_target(self, *path, fs=None):
+        """remote_dir_target() on `fs` (default: fs_StatInference, which falls back to
+        fs_default) that also works when it is a local directory.
 
         FLAF's remote_dir_target() handles a str fs and a remote fs but not a
         law.LocalFileSystem: it falls through to WLCGDirectoryTarget(), which raises
@@ -74,10 +75,10 @@ class StatInferenceTask(Task):
         without this, output() raises and luigi reports the task as having "error in
         complete() method".
         """
-        fs = self.fs_default
+        fs = fs or self.fs_StatInference
         if isinstance(fs, law.LocalFileSystem):
             return law.LocalDirectoryTarget(os.path.join(*path), fs=fs)
-        return self.remote_dir_target(*path)
+        return self.remote_dir_target(*path, fs=fs)
 
     def statinference_settings(self):
         """global.yaml's `StatInference` block, which every era of the task must share."""
@@ -176,13 +177,16 @@ class StatInferenceTask(Task):
         return (self.version, self.__class__.__name__)
 
     def remote_log_dir_target(self):
-        """Job logs of a version and class, for the same reason as store_parts()."""
-        return self.output_dir_target(self.version, "logs", self.__class__.__name__)
+        """Job logs of a version and class, for the same reason as store_parts(); on
+        fs_default, where FLAF stages every job log."""
+        return self.output_dir_target(
+            self.version, "logs", self.__class__.__name__, fs=self.fs_default
+        )
 
     def datacards_dir(self, era, card=None):
         """Local directory holding the datacards of one card and era.
 
-        The cards are produced on fs_default but must be real local files by the time
+        The cards are produced on fs_StatInference but must be real local files by the time
         combine sees them; ResonantLimitsTask mirrors them here and everything downstream
         (dhi's --multi-datacards globbing, the overlay plots) resolves against this path.
         """
@@ -429,7 +433,7 @@ class StatInferenceTask(Task):
             raise RuntimeError(
                 f"{len(missing)} of {len(targets)} merged histograms are missing under "
                 f"hists_version='{self.input_hists_version}' "
-                f"(<fs_HistTuple>/{self.input_hists_version}/Hists_merged/<era>/<var>/<var>.root): "
+                f"(<fs_Hists>/{self.input_hists_version}/Hists_merged/<era>/<var>/<var>.root): "
                 + ", ".join(missing)
             )
 

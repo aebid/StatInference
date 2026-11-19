@@ -36,7 +36,7 @@ class PlotResonantLimitsTask(DhiPlotMixin, CardTask):
     cannot show. External limits and luminosity projections are separate curves rather than
     datacards, so they appear only on the overlay.
 
-    The finished plots are copied to fs_default alongside the rest of the chain's
+    The finished plots are copied to fs_StatInference alongside the rest of the chain's
     products; see DhiPlotMixin for how a dhi plot task is run and its output collected.
     """
 
@@ -56,7 +56,7 @@ class PlotResonantLimitsTask(DhiPlotMixin, CardTask):
         return [ResonantLimitsTask.req(self)]
 
     def output(self):
-        # fs_default, like CreateDatacardsTask. Holds one
+        # fs_StatInference, like CreateDatacardsTask. Holds one
         # <era>/ sub-directory of plots plus plots.json naming them.
         if self.all_cards:
             return {card: task.output() for card, task in self.card_tasks().items()}

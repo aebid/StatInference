@@ -104,7 +104,7 @@ class CreateDatacardsTask(StatInferenceTask, HTCondorWorkflow, law.LocalWorkflow
         )
 
     def output(self):
-        # fs_default, one directory per mass under the card's era. Note that combine cannot
+        # fs_StatInference, one directory per mass under the card's era. Note that combine cannot
         # read these directly: ResonantLimitsTask mirrors an era's masses back into one
         # datacards_dir() before handing them to dhi -- see ResonantLimitsTask.stage_datacards.
         card = self.branch_data["card"]

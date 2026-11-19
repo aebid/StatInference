@@ -97,7 +97,7 @@ class ResonantLimitsTask(CardTask):
         }
 
     def stage_datacards(self, era, remote_targets):
-        """Mirror an era's datacards from fs_default to a stable local path, returned.
+        """Mirror an era's datacards from fs_StatInference to a stable local path, returned.
 
         CreateDatacardsTask writes each mass to its own directory; they are merged here
         into the one directory per era that the limits and the plots glob, laid out as when
@@ -106,7 +106,7 @@ class ResonantLimitsTask(CardTask):
         replacing the other. The shape plots are named by variable, which several masses
         may share, so each mass's plots/ is mirrored to plots/<its directory>/.
 
-        CreateDatacardsTask writes to fs_default, but the cards must be real local files
+        CreateDatacardsTask writes to fs_StatInference, but the cards must be real local files
         by the time combine sees them: MergeResonantLimits shells out to combine, and
         PlotMultipleResonantLimits resolves --multi-datacards by globbing the filesystem
         outside law entirely. A localize() scratch dir will not do -- run() yields, which

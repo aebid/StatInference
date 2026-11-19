@@ -67,7 +67,7 @@ histogram?*
   once through `self.common(getter, what)` or `statinference_settings()`, which raise when
   the eras disagree. FLAF's `check_era_rename.py`, run in CI, rejects `self.era[...]` and an
   `era=` keyword in `req()`; `self.global_params`, `self.setup`, `self.fs_*`
-  (except `fs_default`) and `self.datasets` are not checked statically and raise `EraScopeError` only
+  (except `fs_default` and `fs_StatInference`) and `self.datasets` are not checked statically and raise `EraScopeError` only
   when run over several eras, which the unit tests do (three eras) — flag them in review.
 - The tasks a run starts from that are not workflows (`ResonantLimitsTask`, the plot tasks,
   `ResonantLimitsAndHistPlotTask`) check the eras against the cards when they are constructed
@@ -82,14 +82,17 @@ histogram?*
   its `eras:`; `era` may be a group era (`era_groups:`), never in the task's `era` because FLAF's
   `Setup` knows only real eras. `get_sub_eras(card_era, card)` lists the real eras whose
   histograms feed a card's era; `MergedHists` reads each with `hist_era` from that era's own
-  `fs_HistTuple`.
+  `fs_Hists` (`get_fs("Hists")`, which falls back to `fs_HistTuple`: where FLAF's
+  `HistMergerTask` writes them; never `fs_HistTuple` directly).
 - `ResonantLimitsTask` and the plot tasks are `CardTask`s: with `--card X` they require only
   X's datacard branches (so only X is built and preprocessed); without it they stand for every
   card. The construction-time era check covers every card, since the workflows' maps do.
 - Outputs are keyed on the version, the card and its era, the job state and the logs on the
   version and the class (`store_parts()`, `remote_log_dir_target()`), never on `--era`, so a
   run over more eras resumes the same jobs. The scripts of the chain get the card as one merged
-  file, `card_config.yaml`, kept next to their output.
+  file, `card_config.yaml`, kept next to their output. Products go through
+  `output_dir_target()` to `fs_StatInference` (one for all eras, falling back to `fs_default`);
+  job logs stay on `fs_default`, like FLAF's.
 
 ### Binning optimisation
 
@@ -133,6 +136,6 @@ Verified 2026-08-27 (Tests row 2026-10-29); re-check before relying on any of it
 | Layout | `dc_make/` (datacard construction: `maker.py`, `create_datacards.py`, `process.py`, `model.py`, `uncertainty.py`, `binner.py`), `bin_opt/` (binning optimisation and limits), `common/` (`tools.py`, `param_parse.py`), `law/tasks.py`, `fit_val/`, `config/`, `legacy/`, `test/` (unit tests and their scratch analysis) |
 | Consumers | HH_bbtautau and HH_bbWW use this as a submodule; H_mumu does not |
 | Cards | analysis-side, listed in the analysis's `global.yaml` (`StatInference.cards`), e.g. `HH_bbWW/config/Datacards/DL/dl_spin0.yaml` (includes `../systematics.yaml` and `dl_common.yaml`) or the CI's `CI/CI_card_DL.yaml` |
-| Tests | `test/test_law_chain.py` (the law tasks on the real FLAF and law classes over a scratch analysis, `test/statinference_fixture.py`: per card the outputs, inputs and payload commands), `test/test_card_eras.py` (the card workflows over several eras) `test/test_shape_plots.py` (which histograms a card's shape plots show, through `input_categories`), `test/test_card_config.py` (the card loader's merge rules and errors, `cards:`/`config:`, a chain over several cards, `--card`) and `test/test_external_limits.py`; no ROOT, Combine or dhi; run by `unit-tests` against a pinned FLAF commit. `test/test_hist_ownership.py` (no histogram copy or fit function of `dc_make` left owned by nobody) needs ROOT, is marked `needs_root` and is not run by `unit-tests` |
+| Tests | `test/test_law_chain.py` (the law tasks on the real FLAF and law classes over a scratch analysis, `test/statinference_fixture.py`: per card the outputs, inputs and payload commands), `test/test_card_eras.py` (the card workflows over several eras) `test/test_shape_plots.py` (which histograms a card's shape plots show, through `input_categories`), `test/test_card_config.py` (the card loader's merge rules and errors, `cards:`/`config:`, a chain over several cards, `--card`), `test/test_storage_keys.py` (`fs_Hists` read, `fs_StatInference` written) and `test/test_external_limits.py`; no ROOT, Combine or dhi; run by `unit-tests` against a pinned FLAF commit. `test/test_hist_ownership.py` (no histogram copy or fit function of `dc_make` left owned by nobody) needs ROOT, is marked `needs_root` and is not run by `unit-tests` |
 | Workflows | `formatting-check`, `unit-tests`, `repo-sanity-checks` (FLAF's sanity checks and FLAF's `run_tools/check_era_rename.py` for leftovers of the `period` → `era` rename), `trigger-flaf-integration`. Formatting is checked automatically — do not comment on it. A change to an assertion of `test/test_law_chain.py` (not to its helpers) changes what the chain is guaranteed to read, write or run — comment on it |
 | Integration test | Triggered by `@cms-flaf-bot please test`; the pipeline configuration lives in `cms-flaf/FLAF_ci` |
